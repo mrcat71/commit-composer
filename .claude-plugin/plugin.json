@@ -1,0 +1,13 @@
+{
+  "name": "commit-composer",
+  "version": "0.1.4",
+  "description": "Mark and recompose git commits in a TUI (pick / reword / squash / fixup / drop / edit / reorder)",
+  "author": {
+    "name": "Andrey Svinarenko"
+  },
+  "repository": "https://github.com/mrcat71/commit-composer",
+  "license": "MIT",
+  "keywords": ["git", "rebase", "tui", "commits", "history"],
+  "commands": "./.claude-plugin/commands/",
+  "skills": "./.claude-plugin/skills/"
+}

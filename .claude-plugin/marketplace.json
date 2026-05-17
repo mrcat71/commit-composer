@@ -1,0 +1,16 @@
+{
+  "name": "mrcat71",
+  "owner": {
+    "name": "Andrey Svinarenko"
+  },
+  "description": "Plugin marketplace published by mrcat71.",
+  "plugins": [
+    {
+      "name": "commit-composer",
+      "source": "./",
+      "description": "Mark and recompose git commits in a TUI (pick / reword / squash / fixup / drop / edit / reorder).",
+      "version": "0.1.4",
+      "category": "git"
+    }
+  ]
+}
