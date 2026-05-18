@@ -30,6 +30,11 @@ const maxDefaultDepth = 5000
 // separate stage + commit pass that runs around the rebase.
 const UncommittedSHA = "WORKING"
 
+// EmptyTreeSHA is the well-known git hash of an empty tree. Used as a
+// synthetic parent for the initial commit so `git diff EMPTY..<sha>` works
+// uniformly across normal and root-only commits.
+const EmptyTreeSHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
 // IsUncommitted reports whether sha is the synthetic working-tree marker.
 func IsUncommitted(sha string) bool { return sha == UncommittedSHA }
 
@@ -125,7 +130,10 @@ func (r Repo) UpstreamRange(ctx context.Context) (string, error) {
 //	"<base>..<head>"  -> as given (both sides resolved to full SHAs)
 //	""                -> upstream..HEAD if available AND non-empty,
 //	                     else HEAD~N..HEAD where N = min(10, count-1).
-//	                     Errors only if the repo has fewer than 2 commits.
+//	                     For a single-commit repo, returns base="" (the
+//	                     empty-tree sentinel) + head=HEAD so the initial
+//	                     commit can be edited too.
+//	                     Errors only if the repo has zero commits.
 func (r Repo) ResolveRange(ctx context.Context, spec string) (base, head string, rangeSpec string, err error) {
 	spec = strings.TrimSpace(spec)
 	if spec == "" {
@@ -144,10 +152,26 @@ func (r Repo) ResolveRange(ctx context.Context, spec string) (base, head string,
 		if spec == "" {
 			n, derr := r.firstParentDepth(ctx, "HEAD")
 			if derr != nil {
+				// firstParentDepth errors on a repo with zero commits because
+				// HEAD does not resolve. Map that to a friendly message rather
+				// than leaking git's "ambiguous argument 'HEAD'" stderr.
+				if _, perr := r.RevParse(ctx, "HEAD"); perr != nil {
+					return "", "", "", fmt.Errorf("repo has no commits yet - make an initial commit first")
+				}
 				return "", "", "", fmt.Errorf("default range: %w", derr)
 			}
-			if n < 2 {
-				return "", "", "", fmt.Errorf("default range needs at least 2 commits, found %d - pass a range like HEAD~N or <base>..<head>", n)
+			if n == 0 {
+				return "", "", "", fmt.Errorf("repo has no commits yet - make an initial commit first")
+			}
+			if n == 1 {
+				// Single commit (the initial commit). Use the empty tree as
+				// synthetic base so the user can still recompose / drop /
+				// reword it, and so an "uncommitted" row can stack on top.
+				head, err = r.RevParse(ctx, "HEAD")
+				if err != nil {
+					return "", "", "", fmt.Errorf("resolve HEAD: %w", err)
+				}
+				return "", head, "HEAD", nil
 			}
 			depth := n - 1
 			if depth > maxDefaultDepth {
@@ -187,11 +211,20 @@ func (r Repo) ResolveRange(ctx context.Context, spec string) (base, head string,
 
 // Log returns the commits in base..head, ordered oldest-first (so the slice
 // reads top-to-bottom the same way `git rebase -i` shows them).
+//
+// When base is empty (single-commit repo), runs `git log head` without a
+// range so the root commit is included.
 func (r Repo) Log(ctx context.Context, base, head string) ([]Commit, error) {
 	const sep = "\x1f"
 	const recsep = "\x1e"
 	format := strings.Join([]string{"%H", "%h", "%an", "%ae", "%aI", "%s", "%b"}, sep)
-	out, err := r.Run(ctx, "log", "--reverse", "--no-merges", "--format="+format+recsep, base+".."+head)
+	args := []string{"log", "--reverse", "--no-merges", "--format=" + format + recsep}
+	if base == "" {
+		args = append(args, head)
+	} else {
+		args = append(args, base+".."+head)
+	}
+	out, err := r.Run(ctx, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -361,6 +394,40 @@ func (r Repo) Diff(ctx context.Context, sha string) (string, error) {
 		return "", err
 	}
 	return strings.TrimLeft(out, "\n"), nil
+}
+
+// DiffPaths returns the patch for the given paths between base and head.
+// When base is empty, diffs against the empty tree (root-commit case). When
+// paths is empty, returns the full diff for the whole tree.
+func (r Repo) DiffPaths(ctx context.Context, base, head string, paths []string) (string, error) {
+	if base == "" {
+		base = EmptyTreeSHA
+	}
+	args := []string{"diff", "--no-color", base, head}
+	if len(paths) > 0 {
+		args = append(args, "--")
+		args = append(args, paths...)
+	}
+	out, err := r.Run(ctx, args...)
+	if err != nil {
+		return "", err
+	}
+	return out, nil
+}
+
+// ParentOrEmpty returns the parent commit of sha walked back n steps along
+// the first-parent chain. If n reaches the root, returns EmptyTreeSHA (the
+// well-known empty-tree hash) so diffs work uniformly.
+func (r Repo) ParentOrEmpty(ctx context.Context, sha string, n int) (string, error) {
+	if n < 1 {
+		n = 1
+	}
+	out, err := r.Run(ctx, "rev-parse", "--verify", fmt.Sprintf("%s~%d^{commit}", sha, n))
+	if err == nil {
+		return strings.TrimSpace(out), nil
+	}
+	// rev-parse failed -> we walked past the root. Use empty tree.
+	return EmptyTreeSHA, nil
 }
 
 // CommitsContainedIn reports which of the given SHAs are reachable from ref.

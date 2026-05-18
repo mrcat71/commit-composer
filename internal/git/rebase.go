@@ -16,8 +16,17 @@ import (
 )
 
 // SplitGroup is one of N resulting commits in a pre-approved recompose.
+//
+// Files is the legacy file-level scope; every diff hunk touching one of the
+// listed paths joins this commit.
+//
+// Hunks is the line-level scope; values are indices into the pool's parsed
+// diff (the array written to <sha>.hunks.json by __split-prepare). When
+// Hunks is non-empty it takes precedence over Files: only the indexed hunks
+// land in this commit. Mixing the two is not supported.
 type SplitGroup struct {
 	Files   []string `json:"files"`
+	Hunks   []int    `json:"hunks,omitempty"`
 	Message string   `json:"message"`
 }
 
@@ -202,12 +211,10 @@ type ApplyOptions struct {
 //  4. commits the uncommitted groups (from <UncommittedSHA>.split.json) on
 //     top of the new HEAD
 func (r Repo) Apply(ctx context.Context, p plan.Plan, opts ApplyOptions) error {
-	if p.Base == "" {
-		return errors.New("plan has no base")
-	}
 	if len(p.Ops) == 0 {
 		return errors.New("plan has no ops")
 	}
+	// Empty base is the single-commit / root-commit case; rebase uses --root.
 	if opts.SelfExe == "" {
 		return errors.New("ApplyOptions.SelfExe is required")
 	}
@@ -280,8 +287,8 @@ func (r Repo) Apply(ctx context.Context, p plan.Plan, opts ApplyOptions) error {
 			return fmt.Errorf("uncommitted recompose needs at least 1 group")
 		}
 		for gi, g := range spec.Groups {
-			if len(g.Files) == 0 {
-				return fmt.Errorf("uncommitted group %d has no files", gi)
+			if len(g.Files) == 0 && len(g.Hunks) == 0 {
+				return fmt.Errorf("uncommitted group %d has neither files nor hunks", gi)
 			}
 			if strings.TrimSpace(g.Message) == "" {
 				return fmt.Errorf("uncommitted group %d has empty message", gi)
@@ -315,8 +322,16 @@ func (r Repo) Apply(ctx context.Context, p plan.Plan, opts ApplyOptions) error {
 
 	// If there are no rebase ops (only uncommitted), skip the rebase entirely.
 	if len(p.Ops) > 0 {
-		if err := runGit("rebase", "-i", p.Base); err != nil {
-			return fmt.Errorf("git rebase -i %s: %w (stage=%s)", p.Base, err, stage)
+		rebaseArgs := []string{"rebase", "-i"}
+		baseLabel := p.Base
+		if p.Base == "" {
+			rebaseArgs = append(rebaseArgs, "--root")
+			baseLabel = "--root"
+		} else {
+			rebaseArgs = append(rebaseArgs, p.Base)
+		}
+		if err := runGit(rebaseArgs...); err != nil {
+			return fmt.Errorf("git rebase -i %s: %w (stage=%s)", baseLabel, err, stage)
 		}
 	}
 
@@ -425,8 +440,8 @@ func validateSplits(p plan.Plan, splitsDir string) error {
 		// Single-group "recompose" is fine - it's essentially a reword + maybe
 		// file reorganisation - but warn? Skip the warning, just allow it.
 		for gi, g := range spec.Groups {
-			if len(g.Files) == 0 {
-				return fmt.Errorf("recompose %s group %d has no files", short(op.SHA), gi)
+			if len(g.Files) == 0 && len(g.Hunks) == 0 {
+				return fmt.Errorf("recompose %s group %d has neither files nor hunks", short(op.SHA), gi)
 			}
 			if strings.TrimSpace(g.Message) == "" {
 				return fmt.Errorf("recompose %s group %d has empty message", short(op.SHA), gi)
@@ -441,9 +456,11 @@ func validateSplits(p plan.Plan, splitsDir string) error {
 }
 
 // executeSplit applies a SplitSpec: reset HEAD by PoolSize commits, then for
-// each group add the listed files and commit with the supplied message.
-// Asserts the working tree is clean afterward (every changed file must belong
-// to some group).
+// each group commit the listed files (file-level) or only the indexed hunks
+// (line-level), depending on which the group specifies.
+//
+// Asserts the working tree is clean afterward (every changed line must
+// belong to some group).
 func (r Repo) executeSplit(ctx context.Context, spec SplitSpec) error {
 	n := spec.PoolSize
 	if n < 1 {
@@ -452,10 +469,40 @@ func (r Repo) executeSplit(ctx context.Context, spec SplitSpec) error {
 	if _, err := r.Run(ctx, "reset", "--mixed", fmt.Sprintf("HEAD~%d", n)); err != nil {
 		return fmt.Errorf("git reset HEAD~%d: %w", n, err)
 	}
+
+	// If any group uses hunk-level scope, parse the full pool diff up front
+	// so we can slice it per group. The diff is taken against HEAD (which is
+	// now the pool's parent after the reset above), giving the same content
+	// the prep step indexed.
+	var poolHunks []Hunk
+	wantsHunks := false
+	for _, g := range spec.Groups {
+		if len(g.Hunks) > 0 {
+			wantsHunks = true
+			break
+		}
+	}
+	if wantsHunks {
+		full, err := r.Run(ctx, "diff", "--no-color", "HEAD")
+		if err != nil {
+			return fmt.Errorf("recompute pool diff for hunk apply: %w", err)
+		}
+		poolHunks, err = ParseHunks(full)
+		if err != nil {
+			return fmt.Errorf("parse pool diff: %w", err)
+		}
+	}
+
 	for i, g := range spec.Groups {
-		args := append([]string{"add", "--"}, g.Files...)
-		if _, err := r.Run(ctx, args...); err != nil {
-			return fmt.Errorf("git add group %d: %w", i, err)
+		if len(g.Hunks) > 0 {
+			if err := r.applyHunkGroup(ctx, i, g, poolHunks); err != nil {
+				return err
+			}
+		} else {
+			args := append([]string{"add", "--"}, g.Files...)
+			if _, err := r.Run(ctx, args...); err != nil {
+				return fmt.Errorf("git add group %d: %w", i, err)
+			}
 		}
 		if _, err := r.Run(ctx, "commit", "-m", g.Message); err != nil {
 			return fmt.Errorf("git commit group %d: %w", i, err)
@@ -467,8 +514,37 @@ func (r Repo) executeSplit(ctx context.Context, spec SplitSpec) error {
 	}
 	if !clean {
 		out, _ := r.Run(ctx, "status", "--porcelain")
-		return fmt.Errorf("recompose %s: working tree not clean after groups - some files were not covered:\n%s",
+		return fmt.Errorf("recompose %s: working tree not clean after groups - some lines were not covered:\n%s",
 			short(spec.SHA), strings.TrimSpace(out))
+	}
+	return nil
+}
+
+// applyHunkGroup stages only the indexed hunks for one group and leaves the
+// rest in the working tree for subsequent groups to claim. Uses
+// `git apply --cached --recount` so small line-offset shifts from earlier
+// groups do not break later applies.
+func (r Repo) applyHunkGroup(ctx context.Context, gi int, g SplitGroup, all []Hunk) error {
+	picked := make([]Hunk, 0, len(g.Hunks))
+	for _, idx := range g.Hunks {
+		if idx < 0 || idx >= len(all) {
+			return fmt.Errorf("group %d hunk index %d out of range (pool has %d hunks)", gi, idx, len(all))
+		}
+		picked = append(picked, all[idx])
+	}
+	patch := BuildPatch(picked)
+	if patch == "" {
+		return fmt.Errorf("group %d: empty patch from %d hunk(s)", gi, len(g.Hunks))
+	}
+	cmd := exec.CommandContext(ctx, "git", "apply", "--cached", "--recount", "-")
+	if r.Dir != "" {
+		cmd.Dir = r.Dir
+	}
+	cmd.Stdin = strings.NewReader(patch)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("git apply --cached group %d: %w: %s", gi, err, strings.TrimSpace(stderr.String()))
 	}
 	return nil
 }

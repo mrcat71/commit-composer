@@ -136,6 +136,61 @@ func TestResolveRange(t *testing.T) {
 	}
 }
 
+// TestResolveRangeSingleCommit regresses the case where a fresh repo has
+// only the initial commit: the TUI would error out instead of opening so
+// the user could not start recomposing at all. The fix returns base=""
+// (empty-tree sentinel) and head=HEAD so Log/Diff/Apply can fall back to
+// the empty tree as parent.
+func TestResolveRangeSingleCommit(t *testing.T) {
+	r := testRepo(t, 1)
+	ctx := context.Background()
+
+	base, head, rs, err := r.ResolveRange(ctx, "")
+	if err != nil {
+		t.Fatalf("ResolveRange single commit: %v", err)
+	}
+	if base != "" {
+		t.Errorf("base=%q want empty sentinel for single-commit repo", base)
+	}
+	if len(head) != 40 {
+		t.Errorf("head=%q want full SHA", head)
+	}
+	if rs != "HEAD" {
+		t.Errorf("range spec=%q want HEAD", rs)
+	}
+
+	commits, err := r.Log(ctx, base, head)
+	if err != nil {
+		t.Fatalf("Log with empty base: %v", err)
+	}
+	if len(commits) != 1 {
+		t.Fatalf("got %d commits, want 1", len(commits))
+	}
+	if commits[0].Subject != "c1" {
+		t.Errorf("subject=%q want c1", commits[0].Subject)
+	}
+}
+
+// TestResolveRangeNoCommits ensures a brand-new repo (no commits at all)
+// returns a friendly error rather than a cryptic git failure.
+func TestResolveRangeNoCommits(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	dir := t.TempDir()
+	r := Repo{Dir: dir}
+	ctx := context.Background()
+	mustRun(t, r, ctx, "init", "-q", "-b", "main")
+
+	_, _, _, err := r.ResolveRange(ctx, "")
+	if err == nil {
+		t.Fatal("expected error on empty repo")
+	}
+	if !strings.Contains(err.Error(), "no commits yet") {
+		t.Errorf("error %q does not mention no commits", err.Error())
+	}
+}
+
 // TestResolveRangeDefaultWithMergeCommits regresses a bug where the default
 // "all commits" fallback used rev-list --count (counting all reachable commits
 // including merged-in branches) to pick HEAD~N. With merge commits in the
