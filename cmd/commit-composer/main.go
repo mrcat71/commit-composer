@@ -179,7 +179,7 @@ func runTUI(ctx context.Context, repo git.Repo, rangeArg, outputPath string, lis
 		IncludeUncommitted: !clean,
 	})
 
-	prog := tea.NewProgram(m, tea.WithAltScreen(), tea.WithOutput(os.Stderr))
+	prog := tea.NewProgram(m, tea.WithAltScreen(), tea.WithOutput(os.Stderr), tea.WithMouseCellMotion())
 	final, err := prog.Run()
 	if err != nil {
 		return fmt.Errorf("tui: %w", err)
@@ -272,6 +272,7 @@ type poolPrepareEntry struct {
 	Subjects    []string `json:"subjects"`
 	DiffPath    string   `json:"diff_path"`
 	FilesPath   string   `json:"files_path"`
+	HunksPath   string   `json:"hunks_path"`
 	CommitsPath string   `json:"commits_path"`
 }
 
@@ -332,12 +333,16 @@ func splitPrepareMain(args []string) error {
 			}
 			diffPath := filepath.Join(*outDir, git.UncommittedSHA+".diff")
 			filesPath := filepath.Join(*outDir, git.UncommittedSHA+".files.txt")
+			hunksPath := filepath.Join(*outDir, git.UncommittedSHA+".hunks.json")
 			commitsPath := filepath.Join(*outDir, git.UncommittedSHA+".commits.txt")
 			if err := os.WriteFile(diffPath, []byte(diffOut), 0o600); err != nil {
 				return fmt.Errorf("write uncommitted diff: %w", err)
 			}
 			if err := os.WriteFile(filesPath, []byte(strings.Join(filesLines, "\n")+"\n"), 0o600); err != nil {
 				return fmt.Errorf("write uncommitted files: %w", err)
+			}
+			if err := writeHunksFile(hunksPath, diffOut); err != nil {
+				return fmt.Errorf("write uncommitted hunks: %w", err)
 			}
 			if err := os.WriteFile(commitsPath, []byte(git.UncommittedSHA+" (uncommitted changes)\n"), 0o600); err != nil {
 				return fmt.Errorf("write uncommitted commits: %w", err)
@@ -349,6 +354,7 @@ func splitPrepareMain(args []string) error {
 				Subjects:    []string{"(uncommitted changes)"},
 				DiffPath:    diffPath,
 				FilesPath:   filesPath,
+				HunksPath:   hunksPath,
 				CommitsPath: commitsPath,
 			})
 			continue
@@ -370,6 +376,7 @@ func splitPrepareMain(args []string) error {
 
 		diffPath := filepath.Join(*outDir, last+".diff")
 		filesPath := filepath.Join(*outDir, last+".files.txt")
+		hunksPath := filepath.Join(*outDir, last+".hunks.json")
 		commitsPath := filepath.Join(*outDir, last+".commits.txt")
 
 		if err := os.WriteFile(diffPath, []byte(diffOut), 0o600); err != nil {
@@ -377,6 +384,9 @@ func splitPrepareMain(args []string) error {
 		}
 		if err := os.WriteFile(filesPath, []byte(filesOut), 0o600); err != nil {
 			return fmt.Errorf("write files: %w", err)
+		}
+		if err := writeHunksFile(hunksPath, diffOut); err != nil {
+			return fmt.Errorf("write hunks: %w", err)
 		}
 
 		var commitLines []string
@@ -398,6 +408,7 @@ func splitPrepareMain(args []string) error {
 			Subjects:    subjects,
 			DiffPath:    diffPath,
 			FilesPath:   filesPath,
+			HunksPath:   hunksPath,
 			CommitsPath: commitsPath,
 		})
 	}
@@ -422,6 +433,24 @@ func splitPrepareMain(args []string) error {
 
 func jsonMarshalIndent(v any) ([]byte, error) {
 	return json.MarshalIndent(v, "", "  ")
+}
+
+// writeHunksFile parses the given unified diff and writes one JSON-encoded
+// Hunk per pool entry to path. Claude consumes this to propose line-level
+// splits via {"hunks": [3, 7, 12]} in the resulting split.json.
+func writeHunksFile(path, diff string) error {
+	hs, err := git.ParseHunks(diff)
+	if err != nil {
+		return err
+	}
+	if hs == nil {
+		hs = []git.Hunk{}
+	}
+	data, err := json.MarshalIndent(hs, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o600)
 }
 
 // reviewProposalMain is invoked as `commit-composer __review-proposal
@@ -454,8 +483,32 @@ func reviewProposalMain(args []string) error {
 		return errors.New("__review-proposal: no proposals found in splits dir")
 	}
 
-	m := tui.NewReview(tui.ReviewOptions{Pools: pools, RepoDir: *repoDir})
-	prog := tea.NewProgram(m, tea.WithAltScreen(), tea.WithOutput(os.Stderr))
+	ctx := context.Background()
+	repo := git.Repo{Dir: *repoDir}
+	loadDiff := func(poolSHA string, poolSize int, files []string) (string, error) {
+		// Synthetic working-tree pool: show staged + unstaged + untracked
+		// limited to the files in this group.
+		if git.IsUncommitted(poolSHA) {
+			out, err := repo.UncommittedDiff(ctx)
+			if err != nil {
+				return "", err
+			}
+			return filterDiffByFiles(out, files), nil
+		}
+		// Real pool: diff <parent-of-first-commit-in-pool>..<last-commit-of-pool>.
+		size := poolSize
+		if size < 1 {
+			size = 1
+		}
+		parent, err := repo.ParentOrEmpty(ctx, poolSHA, size)
+		if err != nil {
+			return "", err
+		}
+		return repo.DiffPaths(ctx, parent, poolSHA, files)
+	}
+
+	m := tui.NewReview(tui.ReviewOptions{Pools: pools, RepoDir: *repoDir, LoadDiff: loadDiff})
+	prog := tea.NewProgram(m, tea.WithAltScreen(), tea.WithOutput(os.Stderr), tea.WithMouseCellMotion())
 	final, err := prog.Run()
 	if err != nil {
 		return fmt.Errorf("review tui: %w", err)
@@ -511,6 +564,7 @@ func loadPoolsFromSplits(dir string) ([]tui.ProposalPool, error) {
 			PoolSize int    `json:"pool_size"`
 			Groups   []struct {
 				Files   []string `json:"files"`
+				Hunks   []int    `json:"hunks,omitempty"`
 				Message string   `json:"message"`
 				Comment string   `json:"comment,omitempty"`
 			} `json:"groups"`
@@ -523,7 +577,7 @@ func loadPoolsFromSplits(dir string) ([]tui.ProposalPool, error) {
 		}
 		groups := make([]tui.ProposalGroup, len(spec.Groups))
 		for i, g := range spec.Groups {
-			groups[i] = tui.ProposalGroup{Files: g.Files, Message: g.Message, Comment: g.Comment}
+			groups[i] = tui.ProposalGroup{Files: g.Files, Hunks: g.Hunks, Message: g.Message, Comment: g.Comment}
 		}
 		pools = append(pools, tui.ProposalPool{
 			SHA:      spec.SHA,
@@ -541,26 +595,29 @@ func loadPoolsFromSplits(dir string) ([]tui.ProposalPool, error) {
 }
 
 func writeRevisedPools(dir string, pools []tui.ProposalPool) error {
+	type outGroup struct {
+		Files   []string `json:"files"`
+		Hunks   []int    `json:"hunks,omitempty"`
+		Message string   `json:"message"`
+		Comment string   `json:"comment,omitempty"`
+	}
 	for _, p := range pools {
 		path := filepath.Join(dir, p.SHA+".split.json")
 		out := struct {
-			SHA      string `json:"sha"`
-			PoolSize int    `json:"pool_size"`
-			Groups   []struct {
-				Files   []string `json:"files"`
-				Message string   `json:"message"`
-				Comment string   `json:"comment,omitempty"`
-			} `json:"groups"`
+			SHA      string     `json:"sha"`
+			PoolSize int        `json:"pool_size"`
+			Groups   []outGroup `json:"groups"`
 		}{
 			SHA:      p.SHA,
 			PoolSize: p.PoolSize,
 		}
 		for _, g := range p.Groups {
-			out.Groups = append(out.Groups, struct {
-				Files   []string `json:"files"`
-				Message string   `json:"message"`
-				Comment string   `json:"comment,omitempty"`
-			}{Files: g.Files, Message: g.Message, Comment: g.Comment})
+			out.Groups = append(out.Groups, outGroup{
+				Files:   g.Files,
+				Hunks:   g.Hunks,
+				Message: g.Message,
+				Comment: g.Comment,
+			})
 		}
 		data, err := json.MarshalIndent(out, "", "  ")
 		if err != nil {
@@ -571,6 +628,45 @@ func writeRevisedPools(dir string, pools []tui.ProposalPool) error {
 		}
 	}
 	return nil
+}
+
+// filterDiffByFiles keeps only the per-file blocks of a unified diff that
+// match one of paths. Used to scope the working-tree diff to a proposed
+// group's file set in the review TUI.
+func filterDiffByFiles(diff string, paths []string) string {
+	if len(paths) == 0 {
+		return diff
+	}
+	keep := make(map[string]bool, len(paths))
+	for _, p := range paths {
+		keep[p] = true
+	}
+	var out strings.Builder
+	var cur strings.Builder
+	var include bool
+	flush := func() {
+		if include {
+			out.WriteString(cur.String())
+		}
+		cur.Reset()
+		include = false
+	}
+	for _, line := range strings.SplitAfter(diff, "\n") {
+		if strings.HasPrefix(line, "diff --git ") {
+			flush()
+			// Parse `diff --git a/<old> b/<new>`. Use the b/ path as the file id.
+			parts := strings.Fields(line)
+			if len(parts) >= 4 {
+				newPath := strings.TrimPrefix(parts[3], "b/")
+				if keep[newPath] {
+					include = true
+				}
+			}
+		}
+		cur.WriteString(line)
+	}
+	flush()
+	return out.String()
 }
 
 func selfPath() (string, error) {
