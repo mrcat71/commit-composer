@@ -9,7 +9,7 @@
       "name": "commit-composer",
       "source": "./",
       "description": "Mark and recompose git commits in a TUI (pick / reword / squash / fixup / drop / edit / reorder).",
-      "version": "0.1.4",
+      "version": "0.1.5",
       "category": "git"
     }
   ]
