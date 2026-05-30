@@ -15,6 +15,7 @@ M1-M4 implementation session.
 | M6 polish | not started | terminal detection backends untested end-to-end (only the inline fallback is exercised here) |
 | M7 split  | partial     | Superseded by **M8 recompose** (see below). `claude-split` has been renamed to `claude-recompose` and made multi-commit. |
 | M8 recompose | done        | `c` marks commits; consecutive marks pool; Claude analyses pooled diff and proposes feature-grouped commits; **phase 2 review TUI** lets the user reword/squash/drop proposed commits or leave per-group comments that drive a Claude revision loop (capped at 5 iterations); binary auto-executes the approved pool reset + groups during apply. |
+| M9 cc-commit | done        | `/cc-commit` (skill alias `commit-composer:cc-commit`) is a fast-action sibling of `/commit-compose`: synthesizes a WORKING-only plan, runs `__split-prepare`, has Claude propose 1+ groups, applies autonomously via `executeUncommittedRecompose`. No picker TUI, no review TUI, no chat y/N. Accepts optional `$1` free-text hint. Falls back to `/commit-compose` on a clean tree. |
 
 ## Open work
 

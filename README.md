@@ -1,8 +1,16 @@
 # commit-composer
 
 A TUI for marking git commits with rebase actions and applying them via
-`git rebase -i`. Ships as a Claude Code plugin with a `/commit-composer:commit-compose`
-slash command and a model-invoked skill alias.
+`git rebase -i`. Ships as a Claude Code plugin with two slash commands:
+
+- `/commit-composer:commit-compose` - the full TUI flow for reshaping
+  committed history (interactive picker + review TUI).
+- `/commit-composer:cc-commit` - fast-action sibling that turns the
+  current **uncommitted** working tree into 1+ Conventional-Commits-
+  style commits autonomously, no TUI.
+
+Both have model-invoked skill aliases (`commit-composer:commit-composer`
+and `commit-composer:cc-commit`).
 
 ```
 +- Commits (5) ---------------+- Commit a1b2c3d -----------+
@@ -73,6 +81,8 @@ Requires Go 1.24+ and a recent `git` on `$PATH`.
 
 ## Usage
 
+### `/commit-composer:commit-compose` (reshape committed history)
+
 ```
 /commit-composer:commit-compose                # last <upstream>..HEAD (default), or HEAD~10..HEAD
 /commit-composer:commit-compose HEAD~5         # the last 5 commits
@@ -81,14 +91,36 @@ Requires Go 1.24+ and a recent `git` on `$PATH`.
 
 The slash command will:
 
-1. Refuse to start if the working tree is dirty.
-2. Refuse if any commit in the range is reachable from a protected branch
-   (`origin/main`, `origin/master`, `upstream/main`, `upstream/master`).
+1. Allow a dirty working tree (the TUI shows a synthetic "uncommitted"
+   row you can opt into).
+2. Refuse if any commit in the range is reachable from a protected
+   branch (`origin/main`, `origin/master`, `upstream/main`,
+   `upstream/master`).
 3. Launch the TUI in an overlay (tmux popup / Zellij floating / kitty
    overlay / wezterm split / iTerm split / inline).
 4. Capture your structured plan and show it back for confirmation.
 5. Apply the plan via `git rebase -i <base>` driven non-interactively by
    `GIT_SEQUENCE_EDITOR` and `GIT_EDITOR` helpers.
+
+### `/commit-composer:cc-commit` (fast-commit the dirty tree)
+
+```
+/commit-composer:cc-commit                          # auto-split + commit, no TUI
+/commit-composer:cc-commit keep tests separate      # hint biases grouping
+/commit-composer:cc-commit one commit only          # bias toward a single commit
+```
+
+The slash command will:
+
+1. Refuse cleanly if the repo isn't a git repo.
+2. If the working tree is clean, fall back to `/commit-compose` (the
+   full TUI flow on already-committed history).
+3. Otherwise: read the dirty diff, decide on 1+ Conventional-Commits-
+   style groups, write each `git add` + `git commit` autonomously.
+
+No picker TUI, no review TUI, no chat confirmation. Use this when you
+just want your working tree turned into commits. Use `/commit-compose`
+when you want to reshape history that is already committed.
 
 You can also run the binary directly:
 
@@ -252,8 +284,12 @@ commit-composer/
 ├── .claude-plugin/
 │   ├── plugin.json
 │   ├── marketplace.json
-│   ├── commands/commit-compose.md
-│   ├── skills/commit-composer/SKILL.md
+│   ├── commands/
+│   │   ├── commit-compose.md           # full TUI flow
+│   │   └── cc-commit.md                # fast no-TUI working-tree commit
+│   ├── skills/
+│   │   ├── commit-composer/SKILL.md    # alias for /commit-compose
+│   │   └── cc-commit/SKILL.md          # alias for /cc-commit
 │   └── scripts/
 │       ├── launch-commit-composer.sh   # terminal-overlay dispatcher
 │       └── resolve-launcher.sh         # user-override resolver

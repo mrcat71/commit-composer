@@ -8,8 +8,8 @@
     {
       "name": "commit-composer",
       "source": "./",
-      "description": "Mark and recompose git commits in a TUI (pick / reword / squash / fixup / drop / edit / reorder).",
-      "version": "0.1.7",
+      "description": "Mark and recompose git commits in a TUI (pick / reword / squash / fixup / drop / edit / reorder), plus a fast no-TUI working-tree commit via /cc-commit.",
+      "version": "0.2.0",
       "category": "git"
     }
   ]
