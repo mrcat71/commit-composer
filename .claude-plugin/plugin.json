@@ -1,6 +1,6 @@
 {
   "name": "commit-composer",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Mark and recompose git commits in a TUI (pick / reword / squash / fixup / drop / edit / reorder), plus a fast no-TUI working-tree commit via /cc-commit",
   "author": {
     "name": "Andrey Svinarenko"
