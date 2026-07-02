@@ -2,7 +2,14 @@
 name: cc-commit
 description: Fast-commit the working tree. Claude analyses the dirty diff, splits it into 1+ Conventional-Commits-style commits, and applies autonomously without a TUI. Activates on phrases like "commit my changes", "make commits for what I have", "auto-commit this", "split my dirty tree into commits", or "use cc-commit / fast commit". Falls back to /commit-compose when the working tree is clean.
 argument-hint: 'optional: free-text hint, e.g. "keep tests separate"'
-allowed-tools: [Bash, Read, Write]
+model: sonnet
+# effort: low   # uncomment to trade a little grouping/scope quality for more speed
+allowed-tools:
+  - Bash(commit-composer *)
+  - Bash(${CLAUDE_PLUGIN_ROOT}/.claude-plugin/bin/commit-composer *)
+  - Bash(git *)
+  - Read
+  - Write
 ---
 
 # cc-commit (skill alias for /cc-commit)

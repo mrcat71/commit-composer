@@ -85,6 +85,18 @@ func main() {
 				os.Exit(2)
 			}
 			return
+		case "__cc-prepare":
+			if err := ccPrepareMain(os.Args[2:]); err != nil {
+				fmt.Fprintln(os.Stderr, "commit-composer:", err)
+				os.Exit(2)
+			}
+			return
+		case "__launch":
+			if err := launchMain(os.Args[2:]); err != nil {
+				fmt.Fprintln(os.Stderr, "commit-composer:", err)
+				os.Exit(2)
+			}
+			return
 		}
 	}
 
@@ -232,10 +244,12 @@ func runApply(ctx context.Context, repo git.Repo, planFile, splitsDir string) er
 	// synthetic "uncommitted" op - i.e., the user explicitly wants to
 	// recompose their dirty tree into commits.
 	hasUncommittedOp := false
+	hasRebaseOps := false
 	for _, op := range p.Ops {
 		if git.IsUncommitted(op.SHA) {
 			hasUncommittedOp = true
-			break
+		} else {
+			hasRebaseOps = true
 		}
 	}
 	clean, err := repo.IsClean(ctx)
@@ -268,12 +282,33 @@ func runApply(ctx context.Context, repo git.Repo, planFile, splitsDir string) er
 		return nil
 	}
 
-	return repo.Apply(ctx, p, git.ApplyOptions{
+	// For the cc-commit shape (dirty tree recomposed on top of HEAD, no rebase
+	// ops), capture HEAD so we can list the created commits afterward and save
+	// the slash command a separate `git log` round-trip.
+	var preHead string
+	if hasUncommittedOp && !hasRebaseOps {
+		preHead, _ = repo.RevParse(ctx, "HEAD")
+	}
+
+	if err := repo.Apply(ctx, p, git.ApplyOptions{
 		SelfExe:   self,
 		SplitsDir: splitsDir,
 		Stdout:    os.Stdout,
 		Stderr:    os.Stderr,
-	})
+	}); err != nil {
+		return err
+	}
+
+	if preHead != "" {
+		if out, err := repo.Run(ctx, "log", "--reverse", "--format=%h %s", preHead+"..HEAD"); err == nil {
+			for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+				if line != "" {
+					fmt.Println("COMMITTED " + line)
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // poolPrepareEntry is the per-pool manifest entry produced by __split-prepare.
@@ -301,18 +336,43 @@ type poolPrepareEntry struct {
 func splitPrepareMain(args []string) error {
 	fs := flag.NewFlagSet("__split-prepare", flag.ContinueOnError)
 	planPath := fs.String("plan", "", "path to plan file")
-	outDir := fs.String("out", "", "output directory for split-prep artifacts")
+	outDir := fs.String("out", "", "output directory for split-prep artifacts (default: a new temp dir)")
 	dir := fs.String("C", "", "run as if started in this directory")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *planPath == "" || *outDir == "" {
-		return errors.New("__split-prepare: --plan and --out are required")
+	if *planPath == "" {
+		return errors.New("__split-prepare: --plan is required")
 	}
-	if err := os.MkdirAll(*outDir, 0o700); err != nil {
+	out := *outDir
+	emitDir := false
+	if out == "" {
+		d, err := os.MkdirTemp("", "commit-composer-splits-")
+		if err != nil {
+			return fmt.Errorf("mkdir splits: %w", err)
+		}
+		out = d
+		emitDir = true
+	}
+	if err := runSplitPrepare(context.Background(), *planPath, out, *dir); err != nil {
+		return err
+	}
+	if emitDir {
+		fmt.Println("SPLITS_DIR=" + out)
+	}
+	fmt.Println(filepath.Join(out, "manifest.json"))
+	return nil
+}
+
+// runSplitPrepare writes the per-pool split-prep artifacts for the plan at
+// planPath into outDir (created if needed). It is shared by __split-prepare
+// and __cc-prepare; callers print whatever paths they need. It never writes
+// to stdout so callers control the machine-readable output.
+func runSplitPrepare(ctx context.Context, planPath, outDir, dir string) error {
+	if err := os.MkdirAll(outDir, 0o700); err != nil {
 		return fmt.Errorf("mkdir out: %w", err)
 	}
-	f, err := os.Open(*planPath)
+	f, err := os.Open(planPath)
 	if err != nil {
 		return fmt.Errorf("open plan: %w", err)
 	}
@@ -321,8 +381,7 @@ func splitPrepareMain(args []string) error {
 	if err != nil {
 		return fmt.Errorf("parse plan: %w", err)
 	}
-	repo := git.Repo{Dir: *dir}
-	ctx := context.Background()
+	repo := git.Repo{Dir: dir}
 
 	pools := git.RecomposePools(p)
 	manifest := make([]poolPrepareEntry, 0, len(pools))
@@ -343,10 +402,10 @@ func splitPrepareMain(args []string) error {
 			for _, f := range files {
 				filesLines = append(filesLines, f.Status+"\t"+f.Path)
 			}
-			diffPath := filepath.Join(*outDir, git.UncommittedSHA+".diff")
-			filesPath := filepath.Join(*outDir, git.UncommittedSHA+".files.txt")
-			hunksPath := filepath.Join(*outDir, git.UncommittedSHA+".hunks.json")
-			commitsPath := filepath.Join(*outDir, git.UncommittedSHA+".commits.txt")
+			diffPath := filepath.Join(outDir, git.UncommittedSHA+".diff")
+			filesPath := filepath.Join(outDir, git.UncommittedSHA+".files.txt")
+			hunksPath := filepath.Join(outDir, git.UncommittedSHA+".hunks.json")
+			commitsPath := filepath.Join(outDir, git.UncommittedSHA+".commits.txt")
 			if err := os.WriteFile(diffPath, []byte(diffOut), 0o600); err != nil {
 				return fmt.Errorf("write uncommitted diff: %w", err)
 			}
@@ -386,10 +445,10 @@ func splitPrepareMain(args []string) error {
 			return fmt.Errorf("diff name-status %s..%s: %w", parent[:7], last[:7], ferr)
 		}
 
-		diffPath := filepath.Join(*outDir, last+".diff")
-		filesPath := filepath.Join(*outDir, last+".files.txt")
-		hunksPath := filepath.Join(*outDir, last+".hunks.json")
-		commitsPath := filepath.Join(*outDir, last+".commits.txt")
+		diffPath := filepath.Join(outDir, last+".diff")
+		filesPath := filepath.Join(outDir, last+".files.txt")
+		hunksPath := filepath.Join(outDir, last+".hunks.json")
+		commitsPath := filepath.Join(outDir, last+".commits.txt")
 
 		if err := os.WriteFile(diffPath, []byte(diffOut), 0o600); err != nil {
 			return fmt.Errorf("write diff: %w", err)
@@ -436,10 +495,9 @@ func splitPrepareMain(args []string) error {
 	if err != nil {
 		return fmt.Errorf("marshal manifest: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(*outDir, "manifest.json"), mb, 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(outDir, "manifest.json"), mb, 0o600); err != nil {
 		return fmt.Errorf("write manifest: %w", err)
 	}
-	fmt.Println(filepath.Join(*outDir, "manifest.json"))
 	return nil
 }
 
@@ -718,13 +776,22 @@ type rewordManifestEntry struct {
 func rewordPrepareMain(args []string) error {
 	fs := flag.NewFlagSet("__reword-prepare", flag.ContinueOnError)
 	planPath := fs.String("plan", "", "path to plan file")
-	outDir := fs.String("out", "", "output directory for reword artifacts")
+	outDir := fs.String("out", "", "output directory for reword artifacts (default: a new temp dir)")
 	dir := fs.String("C", "", "run as if started in this directory")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *planPath == "" || *outDir == "" {
-		return errors.New("__reword-prepare: --plan and --out are required")
+	if *planPath == "" {
+		return errors.New("__reword-prepare: --plan is required")
+	}
+	emitDir := false
+	if *outDir == "" {
+		d, err := os.MkdirTemp("", "commit-composer-rewords-")
+		if err != nil {
+			return fmt.Errorf("mkdir rewords: %w", err)
+		}
+		*outDir = d
+		emitDir = true
 	}
 	if err := os.MkdirAll(*outDir, 0o700); err != nil {
 		return fmt.Errorf("mkdir out: %w", err)
@@ -785,6 +852,9 @@ func rewordPrepareMain(args []string) error {
 	manifestPath := filepath.Join(*outDir, "reword-manifest.json")
 	if err := os.WriteFile(manifestPath, mb, 0o600); err != nil {
 		return fmt.Errorf("write manifest: %w", err)
+	}
+	if emitDir {
+		fmt.Println("REWORDS_DIR=" + *outDir)
 	}
 	fmt.Println(manifestPath)
 	return nil

@@ -2,7 +2,14 @@
 name: commit-composer
 description: Recompose a range of git commits in a TUI (pick / reword / squash / fixup / drop / edit / reorder). Activates on phrases like "reshape my commits", "clean up commit history", "interactive rebase with a UI", "squash these commits", or "commit composer".
 argument-hint: 'optional: <rev> or <base>..<head>'
-allowed-tools: [Bash, Read, Write]
+model: sonnet
+# effort: low   # uncomment to trade a little message quality for more speed
+allowed-tools:
+  - Bash(commit-composer *)
+  - Bash(${CLAUDE_PLUGIN_ROOT}/.claude-plugin/bin/commit-composer *)
+  - Bash(git *)
+  - Read
+  - Write
 ---
 
 # commit-composer (skill alias for /commit-compose)

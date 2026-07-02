@@ -163,11 +163,20 @@ testing a development build without overwriting the installed one.
 
 ## Override the launcher script
 
-If you want to customise terminal-overlay behaviour without forking the
-plugin, drop a replacement into your Claude data directory:
+The slash commands run the terminal-overlay launcher through
+`commit-composer __launch`, which resolves `launch-commit-composer.sh`
+in this order:
+
+1. `$COMMIT_COMPOSER_LAUNCHER` (if set and executable)
+2. `$CLAUDE_PLUGIN_DATA/scripts/launch-commit-composer.sh` (user override)
+3. `<plugin-root>/.claude-plugin/scripts/launch-commit-composer.sh`
+   (from the `--plugin-root` the command passes, i.e. `$CLAUDE_PLUGIN_ROOT`)
+4. `<binary-dir>/../scripts/launch-commit-composer.sh` (source checkout)
+
+To customise terminal-overlay behaviour without forking the plugin,
+either point `COMMIT_COMPOSER_LAUNCHER` at your script or drop a
+replacement into your Claude data directory:
 
 ```
 $CLAUDE_PLUGIN_DATA/scripts/launch-commit-composer.sh
 ```
-
-`resolve-launcher.sh` prefers that copy over the bundled one.

@@ -125,12 +125,25 @@ when you want to reshape history that is already committed.
 You can also run the binary directly:
 
 ```bash
-commit-composer HEAD~5                              # interactive TUI, prints plan to stdout
-commit-composer --output=plan.txt HEAD~5            # write plan to a file
-commit-composer --apply --plan=plan.txt             # apply (no claude-split)
+commit-composer HEAD~5                               # interactive TUI, prints plan to stdout
+commit-composer --output=plan.txt HEAD~5             # write plan to a file
+commit-composer --apply --plan=plan.txt              # apply (no claude-split)
 commit-composer --apply --plan=plan.txt --splits=DIR # apply (with claude-split JSONs)
-commit-composer __split-prepare --plan=FILE --out=DIR # extract diffs for Claude to analyse
-commit-composer --list HEAD~5                       # print resolved commits and exit
+commit-composer --list HEAD~5                        # print resolved commits and exit
+```
+
+The slash commands drive the binary through a few internal
+subcommands so every command they issue is a single `commit-composer …`
+call (no `mktemp`, `$(…)`, or `sh -c` leaking into the command line -
+which keeps shell-approval hooks quiet and lets one `Bash(commit-composer *)`
+allow rule cover the whole plugin). They create their own temp files and
+print `KEY=value` lines:
+
+```bash
+commit-composer __cc-prepare                              # /cc-commit pre-flight: DIRTY=/PLAN_FILE=/SPLITS_DIR=/FILES=
+commit-composer __split-prepare --plan=FILE               # extract diffs; prints SPLITS_DIR= when --out is omitted
+commit-composer __launch --plugin-root=DIR -- HEAD~5      # run the picker TUI in an overlay; prints PLAN_FILE=/CANCELLED=/SHARED_REF=
+commit-composer __launch --plugin-root=DIR -- __review-proposal --splits=DIR  # run the review TUI; streams the outcome JSON
 ```
 
 ## Keybindings
@@ -276,7 +289,10 @@ commit-composer/
 ├── README.md
 ├── LICENSE                              # MIT
 ├── go.mod
-├── cmd/commit-composer/main.go
+├── cmd/commit-composer/
+│   ├── main.go                        # flags, TUI, apply, __split/__reword helpers
+│   ├── ccprepare.go                   # __cc-prepare (fast-path pre-flight)
+│   └── launch.go                      # __launch (overlay launcher wrapper)
 ├── internal/
 │   ├── git/        # exec wrappers + rebase driver
 │   ├── plan/       # data model + serialize / parse
@@ -291,7 +307,7 @@ commit-composer/
 │   │   ├── commit-composer/SKILL.md    # alias for /commit-compose
 │   │   └── cc-commit/SKILL.md          # alias for /cc-commit
 │   └── scripts/
-│       ├── launch-commit-composer.sh   # terminal-overlay dispatcher
+│       ├── launch-commit-composer.sh   # terminal-overlay dispatcher (run via `commit-composer __launch`)
 │       └── resolve-launcher.sh         # user-override resolver
 ├── scripts/install.sh
 └── docs/

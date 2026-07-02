@@ -1,7 +1,14 @@
 ---
 description: Mark and recompose git commits in a TUI, then apply via git rebase -i. Claude-recompose pools let Claude redesign multiple commits and the user reviews the proposal in the TUI.
 argument-hint: 'optional: <rev> or <base>..<head> (default: upstream..HEAD)'
-allowed-tools: [Bash, Read, Write]
+model: sonnet
+# effort: low   # uncomment to trade a little message quality for more speed
+allowed-tools:
+  - Bash(commit-composer *)
+  - Bash(${CLAUDE_PLUGIN_ROOT}/.claude-plugin/bin/commit-composer *)
+  - Bash(git *)
+  - Read
+  - Write
 ---
 
 # /commit-compose
@@ -147,8 +154,15 @@ Other accepted forms:
 
 The user has explicitly asked for the TUI to launch fast. Do NOT run
 diagnostic bash commands (env dumps, version checks, list-clients,
-etc.). Do NOT narrate "let me check ...". Run **exactly one** bash
-block to do pre-flight + launch, in this order:
+etc.). Do NOT narrate "let me check ...". Every step below is a single
+`commit-composer ...` command - no `mktemp`, no `$(...)`, no `sh -c`.
+The binary does the shell glue (temp files, terminal detection, the
+protected-branch check) internally, which keeps the commands clean
+enough for a single `Bash(commit-composer *)` allow rule.
+
+`commit-composer` must be on `$PATH` (Homebrew installs it there; from
+source, `./scripts/install.sh`). If it is missing, tell the user to
+run `./scripts/install.sh` and stop.
 
 **Token rule:** treat large artifacts as last-resort context. The full
 pool diff can be thousands of lines; reading it always is expensive
@@ -157,39 +171,26 @@ Do NOT re-verify the apply with `go build` / test suites - the binary
 already asserts the working tree is clean. Do NOT grep the binary's
 source to confirm its semantics; trust the documented behaviour below.
 
+Launch the picker TUI:
+
 ```bash
-set -e
-git rev-parse --git-dir >/dev/null 2>&1 || { echo "not in a git repository" >&2; exit 1; }
-# Dirty tree is now allowed - the binary auto-detects it and adds a
-# synthetic "(uncommitted changes)" row at the top of the TUI. The user
-# can mark that row with 'c' to have Claude recompose the dirty tree into
-# coherent commits.
-
-BIN="$(command -v commit-composer 2>/dev/null || true)"
-[ -z "$BIN" ] && BIN="${CLAUDE_PLUGIN_ROOT}/.claude-plugin/bin/commit-composer"
-LAUNCHER="${CLAUDE_PLUGIN_DATA:+$CLAUDE_PLUGIN_DATA/scripts/launch-commit-composer.sh}"
-[ -x "$LAUNCHER" ] || LAUNCHER="${CLAUDE_PLUGIN_ROOT}/.claude-plugin/scripts/launch-commit-composer.sh"
-
-PLAN_FILE="$(mktemp -t commit-composer-plan-XXXXXX)"
-SPLITS_DIR="$(mktemp -d -t commit-composer-splits-XXXXXX)"
-REWORDS_DIR="$(mktemp -d -t commit-composer-rewords-XXXXXX)"
-echo "PLAN_FILE=$PLAN_FILE"
-echo "SPLITS_DIR=$SPLITS_DIR"
-echo "REWORDS_DIR=$REWORDS_DIR"
-echo "BIN=$BIN"
-
-"$LAUNCHER" "$1" >"$PLAN_FILE"
-echo "--- PLAN ---"
-cat "$PLAN_FILE"
+commit-composer __launch --plugin-root="${CLAUDE_PLUGIN_ROOT}" -- "$1"
 ```
 
-If that bash block exits non-zero, surface the error and stop. If
-`$PLAN_FILE` is empty after a clean exit, the user cancelled in the
-TUI - say "cancelled" and stop.
+A dirty tree is fine - the binary auto-detects it and adds a synthetic
+"(uncommitted changes)" row the user can mark with 'c' to have Claude
+recompose the dirty tree into coherent commits. `__launch` runs the
+overlay (tmux popup / Zellij floating / kitty overlay / etc.) and,
+once the TUI closes, prints:
 
-That's the only bash you should run before the TUI appears. No
-diagnostics, no `--help`, no `--version`, no `tmux list-clients`. The
-launcher handles terminal detection itself.
+- `PLAN_FILE=<path>`  - the captured structured plan.
+- `CANCELLED=0|1`     - `1` means the user quit the TUI.
+- `SHARED_REF=<ref>`  - a protected branch the range already contains,
+  or empty (used for the heads-up in step 3).
+
+If the command exits non-zero, surface the error and stop. If
+`CANCELLED=1`, say "cancelled" and stop. That's the only command you
+run before the TUI appears - no diagnostics, no `--version`.
 
 ## 1. Capture the plan
 
@@ -222,12 +223,16 @@ Check whether any line in `$PLAN_FILE` starts with `- claude-recompose`
 
 Consecutive `claude-recompose` rows are **pooled**: their combined diff
 is analysed as one batch and Claude proposes a fresh sequence of
-commits. Prepare the analysis artifacts (re-using `$SPLITS_DIR` from
-step 0):
+commits. Prepare the analysis artifacts (substitute the `PLAN_FILE`
+value the launch step printed):
 
 ```bash
-"$BIN" __split-prepare --plan="$PLAN_FILE" --out="$SPLITS_DIR"
+commit-composer __split-prepare --plan=<PLAN_FILE>
 ```
+
+With `--out` omitted, `__split-prepare` creates the artifacts directory
+itself and prints `SPLITS_DIR=<path>` (followed by the manifest path).
+Use that `SPLITS_DIR` for the rest of the flow.
 
 `__split-prepare` writes, for each pool:
 
@@ -298,11 +303,21 @@ Claude-proposed message under the **Commit-message rules**, and (b) a
 user-review pass in `$EDITOR`. The existing manual reword path (which
 produces normal `- reword <sha> :: <msg>` lines) is unaffected.
 
-Prepare per-commit artifacts:
+Prepare per-commit artifacts (substitute the `PLAN_FILE` value from the
+launch step):
 
 ```bash
-"$BIN" __reword-prepare --plan="$PLAN_FILE" --out="$REWORDS_DIR"
+commit-composer __reword-prepare --plan=<PLAN_FILE>
 ```
+
+With `--out` omitted it creates the directory itself and prints
+`REWORDS_DIR=<path>` (followed by the manifest path). Use that
+`REWORDS_DIR` below.
+
+> Note: the `$EDITOR` review loop below is the one remaining step that
+> shells out interactively (it opens your editor per commit), so it may
+> prompt under a strict shell-approval setup. It only runs when you
+> actually pick claude-reword in the TUI.
 
 `__reword-prepare` writes for each claude-reword op:
 
@@ -343,10 +358,11 @@ step - that's the signal that the user cancelled that specific reword.
 Surface the error and stop; do not auto-fall-back to the original
 message.
 
-Finally, fold the accepted messages back into the plan:
+Finally, fold the accepted messages back into the plan (substitute the
+`PLAN_FILE` and `REWORDS_DIR` values):
 
 ```bash
-"$BIN" __reword-apply --plan="$PLAN_FILE" --rewords-dir="$REWORDS_DIR"
+commit-composer __reword-apply --plan=<PLAN_FILE> --rewords-dir=<REWORDS_DIR>
 ```
 
 After this step, every `- claude-reword <sha>` line in `$PLAN_FILE` has
@@ -356,23 +372,15 @@ then proceeds with regular reword ops only.
 
 ## 3. Brief protected-branch heads-up (one line)
 
-Run the overlap check silently:
-
-```bash
-SHARED=""
-for ref in origin/main origin/master upstream/main upstream/master; do
-  git rev-parse --verify --quiet "$ref" >/dev/null 2>&1 || continue
-  SHARED="$ref"; break
-done
-```
-
-If `$SHARED` is set, the range overlaps a protected branch. Tell the
-user in ONE chat line, e.g.:
+No command needed - `__launch` already did the overlap check and printed
+`SHARED_REF=<ref>` in step 0. If it is non-empty, the range already lives
+on a protected branch; tell the user in ONE chat line, e.g.:
 
 > Heads-up: these commits are on `origin/master`. Applying will require
 > `git push --force-with-lease` afterwards. Review the plan in the TUI.
 
-Do NOT dump the full plan as text. The next step opens it in the TUI.
+If `SHARED_REF` was empty, say nothing here. Do NOT dump the full plan
+as text. The next step opens it in the TUI.
 
 ## 4. Open the review TUI (this is the single confirmation point)
 
@@ -381,9 +389,11 @@ virtual rows that the user can edit or comment on, and is the place
 where they say "yes apply" / "no cancel":
 
 ```bash
-OUTCOME_FILE="$(mktemp -t commit-composer-review-XXXXXX)"
-"$LAUNCHER" __review-proposal --splits="$SPLITS_DIR" >"$OUTCOME_FILE"
+commit-composer __launch --plugin-root="${CLAUDE_PLUGIN_ROOT}" -- __review-proposal --splits=<SPLITS_DIR>
 ```
+
+`__launch` runs the review overlay and streams the outcome JSON to
+stdout - read it directly from the command output (no temp file).
 
 The TUI keys (mentioned briefly in chat or via `?` inside the TUI):
 - `r` reword (edit message in $EDITOR)
@@ -392,7 +402,7 @@ The TUI keys (mentioned briefly in chat or via `?` inside the TUI):
 - `m` leave a comment for Claude on this group
 - `⏎` submit (apply), `q` cancel
 
-If `$OUTCOME_FILE` is empty / non-zero exit, treat as cancelled.
+If the command errors or prints nothing, treat as cancelled.
 
 Parse the JSON outcome:
 
@@ -426,8 +436,10 @@ redundant and slow - the user can see everything in the TUI.
 
 ## 5. Apply
 
+Substitute the `PLAN_FILE` and `SPLITS_DIR` values:
+
 ```bash
-"$BIN" --apply --plan="$PLAN_FILE" --splits="$SPLITS_DIR"
+commit-composer --apply --plan=<PLAN_FILE> --splits=<SPLITS_DIR>
 ```
 
 (If there were no claude-recompose ops you can omit `--splits` AND
@@ -455,12 +467,10 @@ diverged from any remote; if they need to push, they will need
 `git push --force-with-lease`. **Do NOT run that yourself** - print the
 suggested command.
 
-## 7. Cleanup
+## 7. No cleanup of temp files
 
-```bash
-rm -f "$PLAN_FILE"
-rm -rf "$SPLITS_DIR"
-rm -rf "$REWORDS_DIR"
-```
-
-Run cleanup on both success and cancellation.
+Leave `PLAN_FILE`, `SPLITS_DIR`, and `REWORDS_DIR` on disk on both
+success and cancellation. The user has explicitly forbidden auto-rm of
+these artifacts (they inspect them after runs), and recursive `rm` is
+denied by their shell-approval hook anyway. The OS reaps the temp
+directory on its own schedule.

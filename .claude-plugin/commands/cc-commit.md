@@ -1,7 +1,14 @@
 ---
 description: Fast-commit the working tree. Claude analyses the dirty diff, splits it into 1+ Conventional-Commits-style commits, and applies autonomously. No TUI. Falls back to /commit-compose when the tree is clean.
 argument-hint: 'optional: free-text hint, e.g. "keep tests separate"'
-allowed-tools: [Bash, Read, Write]
+model: sonnet
+# effort: low   # uncomment to trade a little grouping/scope quality for more speed
+allowed-tools:
+  - Bash(commit-composer *)
+  - Bash(${CLAUDE_PLUGIN_ROOT}/.claude-plugin/bin/commit-composer *)
+  - Bash(git *)
+  - Read
+  - Write
 ---
 
 # /cc-commit
@@ -14,6 +21,17 @@ proposal, and the binary autonomously stages + commits each group.
 This is the fast-action sibling of `/commit-compose`. There is **no
 picker TUI**, **no review TUI**, **no chat y/N**. Just analyse and
 commit.
+
+## The binary
+
+Every step is a single `commit-composer ...` invocation - no `mktemp`,
+no `$(...)` command substitution, no `sh -c`, no editor pop. The binary
+does all the shell glue internally so this flow issues clean, one-line
+commands that a `Bash(commit-composer *)` allow rule covers.
+
+`commit-composer` must be on `$PATH` (Homebrew installs it there; from
+source, `./scripts/install.sh` installs it via `go install`). If it is
+not found, tell the user to run `./scripts/install.sh` and stop.
 
 ## Commit-message rules
 
@@ -48,89 +66,59 @@ in a single chat line.
 ## Speed rule (do not violate)
 
 The user has explicitly asked for this to be a fast action. Do NOT run
-diagnostic bash commands (env dumps, version checks, list-clients,
+diagnostic bash commands (env dumps, version checks, `git status`,
 etc.). Do NOT narrate "let me check ...". Do NOT print the full diff
 in chat. Read the artifacts on disk, write the proposal JSON, apply.
 
-## 1. Pre-flight + branch on tree state
+## 1. Pre-flight + prepare (one command)
 
-Run **exactly one** bash block to detect the working tree state and
-locate the binary:
+Run exactly one command to detect the tree state and prepare the
+analysis artifacts:
 
 ```bash
-set -e
-git rev-parse --git-dir >/dev/null 2>&1 || { echo "not in a git repository" >&2; exit 1; }
-
-DIRTY="$(git status --porcelain)"
-if [ -z "$DIRTY" ]; then
-  echo "DIRTY=no"
-else
-  echo "DIRTY=yes"
-fi
-
-BIN="$(command -v commit-composer 2>/dev/null || true)"
-[ -z "$BIN" ] && BIN="${CLAUDE_PLUGIN_ROOT}/.claude-plugin/bin/commit-composer"
-echo "BIN=$BIN"
+commit-composer __cc-prepare
 ```
 
-If the block exits non-zero (not in a git repo), surface the error and
+It prints `KEY=value` lines. Parse them:
+
+- `DIRTY=no` - the working tree is clean; **switch to the
+  `/commit-compose` flow** (see 1a). Nothing else is printed.
+- `DIRTY=yes` - followed by:
+  - `PLAN_FILE=<path>`  - the synthesized WORKING plan.
+  - `SPLITS_DIR=<path>` - directory holding the analysis artifacts.
+  - `FILES=<path>`      - name-status lines for every dirty file
+    (staged + unstaged + untracked).
+
+`__cc-prepare` also wrote, under `SPLITS_DIR`:
+
+- `WORKING.diff`   - the unified diff of the dirty tree vs HEAD.
+- `WORKING.hunks.json` - parsed hunks (ignore unless you want
+  hunk-level splits).
+- `manifest.json`  - structured pool list (one `WORKING` entry).
+
+If the command errors (e.g. not a git repo), surface the error and
 stop.
 
 ### 1a. Clean-tree fallback
 
-If `DIRTY=no`, the working tree has nothing to fast-commit. **Switch
-to the `/commit-compose` flow**: read the file at
+On `DIRTY=no` the working tree has nothing to fast-commit. Read the
+file at
 `${CLAUDE_PLUGIN_ROOT}/.claude-plugin/commands/commit-compose.md`
-(the path the plugin install resolved `commit-compose.md` to) and
-follow it from step 1 onward, passing the user's `$1` through as the
-range argument (it may or may not be a valid range; the binary's
-launcher will error cleanly if it isn't). Do NOT duplicate the
-commit-compose flow inline here - read the file and follow it.
+and follow it from step 1 onward, passing the user's `$1` through as
+the range argument. Do NOT duplicate that flow inline here.
 
 Print one line of chat acknowledging the fallback (e.g. "working tree
 clean, opening the commit-compose TUI instead") and continue.
 
-## 2. Synthesize the minimal plan + run __split-prepare
+## 2. Propose groups
 
-If `DIRTY=yes`, run one more bash block to write the plan and prepare
-the analysis artifacts:
+Read the `FILES` path. **Start with filenames**: if the file paths make
+the topical boundary obvious (e.g. a CI workflow file + a Dockerfile +
+an unrelated README change), you can group without reading the diff at
+all. Reading the full diff is the single biggest token sink in this
+workflow.
 
-```bash
-set -e
-PLAN_FILE="$(mktemp -t cc-commit-plan-XXXXXX)"
-SPLITS_DIR="$(mktemp -d -t cc-commit-splits-XXXXXX)"
-cat > "$PLAN_FILE" <<'EOF'
-## commit-composer plan v1
-base: WORKING
-ops:
-- claude-recompose WORKING
-EOF
-echo "PLAN_FILE=$PLAN_FILE"
-echo "SPLITS_DIR=$SPLITS_DIR"
-
-"$BIN" __split-prepare --plan="$PLAN_FILE" --out="$SPLITS_DIR"
-```
-
-`__split-prepare` writes:
-
-- `$SPLITS_DIR/WORKING.files.txt`   - name-status lines for every
-  file in the dirty tree (staged + unstaged + untracked).
-- `$SPLITS_DIR/WORKING.diff`        - the unified diff of the dirty
-  tree vs HEAD.
-- `$SPLITS_DIR/WORKING.hunks.json`  - parsed hunks (not needed for
-  file-level grouping; ignore unless you want hunk-level splits).
-- `$SPLITS_DIR/manifest.json`       - structured list with one entry
-  for `WORKING`.
-
-## 3. Propose groups
-
-Read `$SPLITS_DIR/WORKING.files.txt`. **Start with filenames**: if the
-file paths make the topical boundary obvious (e.g. a CI workflow file
-+ a Dockerfile + an unrelated README change), you can group without
-reading the diff at all. Reading the full diff is the single biggest
-token sink in this workflow.
-
-Only read `$SPLITS_DIR/WORKING.diff` when:
+Only read `SPLITS_DIR/WORKING.diff` when:
 
 - One file mixes two clearly different concerns and you need to know
   *what* changed to decide grouping.
@@ -141,9 +129,9 @@ Only read `$SPLITS_DIR/WORKING.diff` when:
 **Decide on 1+ groups.** Output count is YOUR judgment - 1, 2, 5, or
 more are all valid. Decide from the diff, not from a fixed number:
 
-- One feature spread across many files → 1 group.
-- Two unrelated topics in the dirty tree → 2 groups.
-- An unrelated docs tweak alongside a feature → split it out.
+- One feature spread across many files -> 1 group.
+- Two unrelated topics in the dirty tree -> 2 groups.
+- An unrelated docs tweak alongside a feature -> split it out.
 
 Factor in the user's `$1` hint when non-empty.
 
@@ -151,7 +139,7 @@ Factor in the user's `$1` hint when non-empty.
 group's `files` array. The binary fails the apply if anything is left
 uncommitted afterward (`executeUncommittedRecompose` clean check).
 
-Write the proposal to `$SPLITS_DIR/WORKING.split.json`:
+Write the proposal to `SPLITS_DIR/WORKING.split.json`:
 
 ```json
 {
@@ -175,10 +163,12 @@ Write the proposal to `$SPLITS_DIR/WORKING.split.json`:
 Do NOT print the proposal in chat. The user does not review it
 beforehand - this is the autonomous fast action.
 
-## 4. Apply
+## 3. Apply
+
+Substitute the `PLAN_FILE` and `SPLITS_DIR` values from step 1:
 
 ```bash
-"$BIN" --apply --plan="$PLAN_FILE" --splits="$SPLITS_DIR"
+commit-composer --apply --plan=<PLAN_FILE> --splits=<SPLITS_DIR>
 ```
 
 The binary will:
@@ -188,14 +178,15 @@ The binary will:
 3. For each group, in order: `git add <files>` + `git commit -m <msg>`.
 4. Verify the working tree is clean afterward (every dirty file was
    placed in exactly one group).
+5. Print one `COMMITTED <shortsha> <subject>` line per created commit.
 
 If apply exits non-zero, surface the error and stop. **Do not** run
 `git reset --hard` or any cleanup; the user inspects what happened.
 
-## 5. Brief summary
+## 4. Brief summary
 
-After a successful apply, print one short chat line per created
-commit, e.g.:
+Use the `COMMITTED` lines the apply step printed - no separate
+`git log`. Echo them back, e.g.:
 
 ```
 Committed:
@@ -203,22 +194,22 @@ Committed:
   def5678 docs(auth): document the refresh flow
 ```
 
-You can use `git log -<N> --oneline HEAD` where N = number of groups
-to fetch the short SHAs. Keep the output to N+1 lines total.
+Keep the output to N+1 lines total.
 
-## 6. No cleanup of temp files
+## 5. No cleanup of temp files
 
-Leave `$PLAN_FILE` and `$SPLITS_DIR` on disk. The user has explicitly
+Leave `PLAN_FILE` and `SPLITS_DIR` on disk. The user has explicitly
 forbidden auto-rm of these artifacts (they like to inspect them after
 runs).
 
 ## Failure modes (one-line surface, then stop)
 
-- Not in a git repo → step 1 errors with `"not in a git repository"`.
-- Binary missing → `$BIN` not executable; surface the path and tell
-  the user to run `./scripts/install.sh`.
-- `__split-prepare` fails → surface the binary's stderr.
-- Apply fails → surface the binary's stderr. The working tree may be
+- Not in a git repo -> `__cc-prepare` errors with `"not in a git
+  repository"`.
+- Binary missing -> `commit-composer` not on `$PATH`; tell the user to
+  run `./scripts/install.sh`.
+- `__cc-prepare` fails -> surface the binary's stderr.
+- Apply fails -> surface the binary's stderr. The working tree may be
   partially committed (some groups landed, later ones did not); do
   not attempt recovery, let the user inspect.
 
