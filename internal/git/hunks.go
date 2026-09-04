@@ -1,7 +1,9 @@
 package git
 
 import (
+	"cmp"
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -10,15 +12,15 @@ import (
 // newline beyond the hunk's own content) so it can be re-emitted as a
 // standalone patch when assembling per-hunk commits.
 type Hunk struct {
-	Index     int    `json:"index"`      // 0-based position in the parent diff
-	File      string `json:"file"`       // post-image path (b/<path>)
-	OldFile   string `json:"old_file"`   // pre-image path (a/<path>); same as File except for renames
-	OldStart  int    `json:"old_start"`  // 1-based old-file starting line
-	OldCount  int    `json:"old_count"`  // number of old-file lines covered
-	NewStart  int    `json:"new_start"`  // 1-based new-file starting line
-	NewCount  int    `json:"new_count"`  // number of new-file lines covered
-	FileHead  string `json:"file_head"`  // diff/index/+++/--- preamble for File (verbatim)
-	Body      string `json:"body"`       // @@ header + diff body for this hunk
+	Index    int    `json:"index"`     // 0-based position in the parent diff
+	File     string `json:"file"`      // post-image path (b/<path>)
+	OldFile  string `json:"old_file"`  // pre-image path (a/<path>); same as File except for renames
+	OldStart int    `json:"old_start"` // 1-based old-file starting line
+	OldCount int    `json:"old_count"` // number of old-file lines covered
+	NewStart int    `json:"new_start"` // 1-based new-file starting line
+	NewCount int    `json:"new_count"` // number of new-file lines covered
+	FileHead string `json:"file_head"` // diff/index/+++/--- preamble for File (verbatim)
+	Body     string `json:"body"`      // @@ header + diff body for this hunk
 }
 
 // ParseHunks splits a unified diff into individual Hunks. The diff is the
@@ -189,13 +191,11 @@ func BuildPatch(hunks []Hunk) string {
 	var b strings.Builder
 	for _, f := range order {
 		g := groups[f]
-		// Sort hunks by NewStart so the patch is monotone (insertion sort).
+		// Sort hunks by NewStart so the patch is monotone.
 		hs := g.items
-		for i := 1; i < len(hs); i++ {
-			for j := i; j > 0 && hs[j-1].NewStart > hs[j].NewStart; j-- {
-				hs[j-1], hs[j] = hs[j], hs[j-1]
-			}
-		}
+		slices.SortStableFunc(hs, func(a, b Hunk) int {
+			return cmp.Compare(a.NewStart, b.NewStart)
+		})
 		b.WriteString(g.head)
 		for _, h := range hs {
 			b.WriteString(h.Body)

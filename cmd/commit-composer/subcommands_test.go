@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -131,6 +132,54 @@ func TestCcPrepareDirtyTree(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(kv["SPLITS_DIR"], git.UncommittedSHA+".diff")); err != nil {
 		t.Errorf("WORKING.diff not written: %v", err)
 	}
+
+	// The file list must also be echoed inline between markers - the /cc-commit
+	// skill injects this output at load time and groups from it without a
+	// follow-up Read.
+	inline, ok := inlineFiles(out)
+	if !ok {
+		t.Fatalf("missing --- BEGIN/END FILES --- markers in output:\n%s", out)
+	}
+	if !strings.Contains(inline, "new.go") {
+		t.Errorf("inline files block missing new.go:\n%s", inline)
+	}
+	if inline != strings.TrimRight(string(fl), "\n") {
+		t.Errorf("inline files block differs from FILES contents:\ninline: %q\nfile:   %q", inline, string(fl))
+	}
+}
+
+// inlineFiles extracts the body between __cc-prepare's file-list markers.
+func inlineFiles(out string) (string, bool) {
+	_, rest, ok := strings.Cut(out, "--- BEGIN FILES ---\n")
+	if !ok {
+		return "", false
+	}
+	body, _, ok := strings.Cut(rest, "\n--- END FILES ---")
+	return body, ok
+}
+
+func TestCcPrepareInlineFilesTruncated(t *testing.T) {
+	dir := gitRepo(t)
+	for i := range maxInlineFiles + 1 {
+		writeFile(t, dir, fmt.Sprintf("f%03d.txt", i), "x\n")
+	}
+
+	out, err := captureStdout(t, func() error {
+		return ccPrepareMain([]string{"-C", dir})
+	})
+	if err != nil {
+		t.Fatalf("ccPrepareMain: %v", err)
+	}
+	if _, ok := inlineFiles(out); ok {
+		t.Error("file list should not be inlined past maxInlineFiles")
+	}
+	if got := parseKV(out)["FILES_TRUNCATED"]; got == "" {
+		t.Errorf("want FILES_TRUNCATED marker, got:\n%s", out)
+	}
+	// The path itself must still be usable when the inline copy is suppressed.
+	if _, err := os.Stat(parseKV(out)["FILES"]); err != nil {
+		t.Errorf("FILES path unusable: %v", err)
+	}
 }
 
 func TestCcPrepareNotGitRepo(t *testing.T) {
@@ -155,15 +204,23 @@ func TestResolveLauncher(t *testing.T) {
 	t.Setenv("CLAUDE_PLUGIN_ROOT", "")
 	t.Setenv("CLAUDE_PLUGIN_DATA", "")
 
+	// writeLauncher creates an executable launcher at <root>/<sub...>/ and
+	// returns its path.
+	writeLauncher := func(t *testing.T, root string, sub ...string) string {
+		t.Helper()
+		dir := filepath.Join(append([]string{root}, sub...)...)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		path := filepath.Join(dir, launcherScript)
+		if err := os.WriteFile(path, []byte("#!/usr/bin/env bash\n"), 0o755); err != nil {
+			t.Fatalf("write script: %v", err)
+		}
+		return path
+	}
+
 	root := t.TempDir()
-	scriptDir := filepath.Join(root, ".claude-plugin", "scripts")
-	if err := os.MkdirAll(scriptDir, 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-	scriptPath := filepath.Join(scriptDir, launcherScript)
-	if err := os.WriteFile(scriptPath, []byte("#!/usr/bin/env bash\n"), 0o755); err != nil {
-		t.Fatalf("write script: %v", err)
-	}
+	scriptPath := writeLauncher(t, root, "scripts")
 
 	t.Run("via plugin-root", func(t *testing.T) {
 		got, err := resolveLauncher(root)
@@ -172,6 +229,46 @@ func TestResolveLauncher(t *testing.T) {
 		}
 		if got != scriptPath {
 			t.Errorf("want %q, got %q", scriptPath, got)
+		}
+	})
+
+	t.Run("via CLAUDE_PLUGIN_ROOT", func(t *testing.T) {
+		envRoot := t.TempDir()
+		want := writeLauncher(t, envRoot, "scripts")
+		t.Setenv("CLAUDE_PLUGIN_ROOT", envRoot)
+		got, err := resolveLauncher("")
+		if err != nil {
+			t.Fatalf("resolveLauncher: %v", err)
+		}
+		if got != want {
+			t.Errorf("want %q, got %q", want, got)
+		}
+	})
+
+	// Pre-0.4 plugin trees kept scripts under .claude-plugin/. A user running a
+	// cached copy of one must still launch.
+	t.Run("legacy .claude-plugin layout still resolves", func(t *testing.T) {
+		legacyRoot := t.TempDir()
+		want := writeLauncher(t, legacyRoot, ".claude-plugin", "scripts")
+		got, err := resolveLauncher(legacyRoot)
+		if err != nil {
+			t.Fatalf("resolveLauncher: %v", err)
+		}
+		if got != want {
+			t.Errorf("want %q, got %q", want, got)
+		}
+	})
+
+	t.Run("current layout wins over legacy", func(t *testing.T) {
+		bothRoot := t.TempDir()
+		writeLauncher(t, bothRoot, ".claude-plugin", "scripts")
+		want := writeLauncher(t, bothRoot, "scripts")
+		got, err := resolveLauncher(bothRoot)
+		if err != nil {
+			t.Fatalf("resolveLauncher: %v", err)
+		}
+		if got != want {
+			t.Errorf("want current layout %q, got %q", want, got)
 		}
 	})
 
@@ -211,14 +308,15 @@ func TestResolveLauncher(t *testing.T) {
 	})
 
 	t.Run("non-executable is skipped", func(t *testing.T) {
-		plain := filepath.Join(t.TempDir(), ".claude-plugin", "scripts")
+		plainRoot := t.TempDir()
+		plain := filepath.Join(plainRoot, "scripts")
 		if err := os.MkdirAll(plain, 0o755); err != nil {
 			t.Fatalf("mkdir: %v", err)
 		}
 		if err := os.WriteFile(filepath.Join(plain, launcherScript), []byte("x"), 0o644); err != nil {
 			t.Fatalf("write: %v", err)
 		}
-		if _, err := resolveLauncher(filepath.Dir(filepath.Dir(plain))); err == nil {
+		if _, err := resolveLauncher(plainRoot); err == nil {
 			t.Error("expected error when only a non-executable launcher exists")
 		}
 	})

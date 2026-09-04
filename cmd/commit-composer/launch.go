@@ -94,7 +94,11 @@ func launchMain(args []string) error {
 
 	shared := ""
 	if !cancelled {
-		shared = sharedProtectedRef(context.Background(), git.Repo{Dir: *dir}, planPath)
+		// Bounded: this is a best-effort heads-up, so it must never be the
+		// reason a launch stalls.
+		ctx, cancel := prepareContext()
+		shared = sharedProtectedRef(ctx, git.Repo{Dir: *dir}, planPath)
+		cancel()
 	}
 
 	fmt.Printf("PLAN_FILE=%s\n", planPath)
@@ -112,12 +116,14 @@ func launchMain(args []string) error {
 //  1. $COMMIT_COMPOSER_LAUNCHER (explicit override)
 //  2. $CLAUDE_PLUGIN_DATA/scripts/<script> (user override; preserves the
 //     pre-0.3 resolve-launcher.sh behaviour)
-//  3. <plugin-root>/.claude-plugin/scripts/<script> (from --plugin-root)
-//  4. $CLAUDE_PLUGIN_ROOT/.claude-plugin/scripts/<script>
-//  5. <exe-dir>/../scripts/<script> (dev tree: bin/ sits next to scripts/)
+//  3. <plugin-root>/scripts/<script> (from --plugin-root)
+//  4. $CLAUDE_PLUGIN_ROOT/scripts/<script>
+//  5. the two paths above under .claude-plugin/ (pre-0.4 layout, for a user
+//     still running a cached copy of the old plugin tree)
+//  6. <exe-dir>/../scripts/<script> (dev tree: bin/ sits next to scripts/)
 //
 // The binary cannot self-locate the launcher under Homebrew (binary in bin/,
-// scripts in share/commit-composer/.claude-plugin/), so --plugin-root or the
+// scripts in share/commit-composer/scripts/), so --plugin-root or the
 // CLAUDE_PLUGIN_ROOT env is the primary mechanism there.
 func resolveLauncher(pluginRoot string) (string, error) {
 	if v := os.Getenv("COMMIT_COMPOSER_LAUNCHER"); v != "" && isExecutable(v) {
@@ -127,11 +133,16 @@ func resolveLauncher(pluginRoot string) (string, error) {
 	if data := os.Getenv("CLAUDE_PLUGIN_DATA"); data != "" {
 		candidates = append(candidates, filepath.Join(data, "scripts", launcherScript))
 	}
-	if pluginRoot != "" {
-		candidates = append(candidates, filepath.Join(pluginRoot, ".claude-plugin", "scripts", launcherScript))
-	}
-	if pr := os.Getenv("CLAUDE_PLUGIN_ROOT"); pr != "" {
-		candidates = append(candidates, filepath.Join(pr, ".claude-plugin", "scripts", launcherScript))
+	// Roots to probe, in order. Each is tried at scripts/ first and then at the
+	// pre-0.4 .claude-plugin/scripts/ location.
+	for _, root := range []string{pluginRoot, os.Getenv("CLAUDE_PLUGIN_ROOT")} {
+		if root == "" {
+			continue
+		}
+		candidates = append(candidates,
+			filepath.Join(root, "scripts", launcherScript),
+			filepath.Join(root, ".claude-plugin", "scripts", launcherScript),
+		)
 	}
 	if exe, err := selfPath(); err == nil {
 		candidates = append(candidates, filepath.Clean(filepath.Join(filepath.Dir(exe), "..", "scripts", launcherScript)))

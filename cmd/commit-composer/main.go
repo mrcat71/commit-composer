@@ -18,11 +18,17 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"golang.org/x/sync/errgroup"
+
 	"github.com/mrcat71/commit-composer/internal/git"
 	"github.com/mrcat71/commit-composer/internal/plan"
 	"github.com/mrcat71/commit-composer/internal/tui"
@@ -354,7 +360,9 @@ func splitPrepareMain(args []string) error {
 		out = d
 		emitDir = true
 	}
-	if err := runSplitPrepare(context.Background(), *planPath, out, *dir); err != nil {
+	ctx, cancel := prepareContext()
+	defer cancel()
+	if err := runSplitPrepare(ctx, *planPath, out, *dir); err != nil {
 		return err
 	}
 	if emitDir {
@@ -368,6 +376,33 @@ func splitPrepareMain(args []string) error {
 // planPath into outDir (created if needed). It is shared by __split-prepare
 // and __cc-prepare; callers print whatever paths they need. It never writes
 // to stdout so callers control the machine-readable output.
+// defaultPrepareTimeout bounds the non-interactive prepare subcommands. They
+// only read from git and write files, so a wedged git subprocess is the one
+// thing that can make them hang - and they run inside a slash command, where a
+// hang is indistinguishable from Claude Code having frozen.
+//
+// The interactive paths deliberately have no deadline: the TUI waits on the
+// user, and `--apply` drives a rebase that pauses on `edit` steps.
+const defaultPrepareTimeout = 60 * time.Second
+
+// prepareContext returns a context bounded by defaultPrepareTimeout, or by
+// COMMIT_COMPOSER_TIMEOUT when set (any Go duration; "0" disables the deadline).
+func prepareContext() (context.Context, context.CancelFunc) {
+	timeout := defaultPrepareTimeout
+	if v := os.Getenv("COMMIT_COMPOSER_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "commit-composer: ignoring invalid COMMIT_COMPOSER_TIMEOUT %q: %v\n", v, err)
+		} else {
+			timeout = d
+		}
+	}
+	if timeout <= 0 {
+		return context.WithCancel(context.Background())
+	}
+	return context.WithTimeout(context.Background(), timeout)
+}
+
 func runSplitPrepare(ctx context.Context, planPath, outDir, dir string) error {
 	if err := os.MkdirAll(outDir, 0o700); err != nil {
 		return fmt.Errorf("mkdir out: %w", err)
@@ -384,111 +419,28 @@ func runSplitPrepare(ctx context.Context, planPath, outDir, dir string) error {
 	repo := git.Repo{Dir: dir}
 
 	pools := git.RecomposePools(p)
-	manifest := make([]poolPrepareEntry, 0, len(pools))
+	// Sorted keys give a deterministic manifest order without a post-sort: each
+	// entry's LastSHA is its map key, so this is the ordering the manifest wants.
+	lasts := slices.Sorted(maps.Keys(pools))
+	manifest := make([]poolPrepareEntry, len(lasts))
 
-	for last, shas := range pools {
-		// Special-case the synthetic working-tree pool: diff is `git diff HEAD`
-		// + untracked, not a commit range.
-		if git.IsUncommitted(last) {
-			diffOut, derr := repo.UncommittedDiff(ctx)
-			if derr != nil {
-				return fmt.Errorf("uncommitted diff: %w", derr)
+	// Pools are independent - separate git reads, separate output files - so
+	// prepare them concurrently. Bounded by CPU count because each one spawns
+	// git subprocesses.
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(runtime.NumCPU())
+	for i, last := range lasts {
+		g.Go(func() error {
+			entry, err := preparePool(gctx, repo, outDir, last, pools[last])
+			if err != nil {
+				return err
 			}
-			files, ferr := repo.UncommittedFiles(ctx)
-			if ferr != nil {
-				return fmt.Errorf("uncommitted files: %w", ferr)
-			}
-			var filesLines []string
-			for _, f := range files {
-				filesLines = append(filesLines, f.Status+"\t"+f.Path)
-			}
-			diffPath := filepath.Join(outDir, git.UncommittedSHA+".diff")
-			filesPath := filepath.Join(outDir, git.UncommittedSHA+".files.txt")
-			hunksPath := filepath.Join(outDir, git.UncommittedSHA+".hunks.json")
-			commitsPath := filepath.Join(outDir, git.UncommittedSHA+".commits.txt")
-			if err := os.WriteFile(diffPath, []byte(diffOut), 0o600); err != nil {
-				return fmt.Errorf("write uncommitted diff: %w", err)
-			}
-			if err := os.WriteFile(filesPath, []byte(strings.Join(filesLines, "\n")+"\n"), 0o600); err != nil {
-				return fmt.Errorf("write uncommitted files: %w", err)
-			}
-			if err := writeHunksFile(hunksPath, diffOut); err != nil {
-				return fmt.Errorf("write uncommitted hunks: %w", err)
-			}
-			if err := os.WriteFile(commitsPath, []byte(git.UncommittedSHA+" (uncommitted changes)\n"), 0o600); err != nil {
-				return fmt.Errorf("write uncommitted commits: %w", err)
-			}
-			manifest = append(manifest, poolPrepareEntry{
-				LastSHA:     git.UncommittedSHA,
-				PoolSize:    0, // 0 marks "not a real pool"
-				Commits:     []string{git.UncommittedSHA},
-				Subjects:    []string{"(uncommitted changes)"},
-				DiffPath:    diffPath,
-				FilesPath:   filesPath,
-				HunksPath:   hunksPath,
-				CommitsPath: commitsPath,
-			})
-			continue
-		}
-		oldest := shas[0]
-		parent, perr := repo.Run(ctx, "rev-parse", oldest+"^")
-		if perr != nil {
-			return fmt.Errorf("resolve parent of %s: %w", oldest[:7], perr)
-		}
-		parent = strings.TrimSpace(parent)
-		diffOut, derr := repo.Run(ctx, "diff", "--no-color", parent, last)
-		if derr != nil {
-			return fmt.Errorf("diff %s..%s: %w", parent[:7], last[:7], derr)
-		}
-		filesOut, ferr := repo.Run(ctx, "diff", "--name-status", parent, last)
-		if ferr != nil {
-			return fmt.Errorf("diff name-status %s..%s: %w", parent[:7], last[:7], ferr)
-		}
-
-		diffPath := filepath.Join(outDir, last+".diff")
-		filesPath := filepath.Join(outDir, last+".files.txt")
-		hunksPath := filepath.Join(outDir, last+".hunks.json")
-		commitsPath := filepath.Join(outDir, last+".commits.txt")
-
-		if err := os.WriteFile(diffPath, []byte(diffOut), 0o600); err != nil {
-			return fmt.Errorf("write diff: %w", err)
-		}
-		if err := os.WriteFile(filesPath, []byte(filesOut), 0o600); err != nil {
-			return fmt.Errorf("write files: %w", err)
-		}
-		if err := writeHunksFile(hunksPath, diffOut); err != nil {
-			return fmt.Errorf("write hunks: %w", err)
-		}
-
-		var commitLines []string
-		var subjects []string
-		for _, sha := range shas {
-			subjOut, _ := repo.Run(ctx, "log", "-1", "--format=%s", sha)
-			subj := strings.TrimSpace(subjOut)
-			subjects = append(subjects, subj)
-			commitLines = append(commitLines, sha+" "+subj)
-		}
-		if err := os.WriteFile(commitsPath, []byte(strings.Join(commitLines, "\n")+"\n"), 0o600); err != nil {
-			return fmt.Errorf("write commits: %w", err)
-		}
-
-		manifest = append(manifest, poolPrepareEntry{
-			LastSHA:     last,
-			PoolSize:    len(shas),
-			Commits:     shas,
-			Subjects:    subjects,
-			DiffPath:    diffPath,
-			FilesPath:   filesPath,
-			HunksPath:   hunksPath,
-			CommitsPath: commitsPath,
+			manifest[i] = entry
+			return nil
 		})
 	}
-
-	// Sort by LastSHA for stable output.
-	for i := 1; i < len(manifest); i++ {
-		for j := i; j > 0 && manifest[j-1].LastSHA > manifest[j].LastSHA; j-- {
-			manifest[j-1], manifest[j] = manifest[j], manifest[j-1]
-		}
+	if err := g.Wait(); err != nil {
+		return err
 	}
 
 	mb, err := jsonMarshalIndent(manifest)
@@ -499,6 +451,91 @@ func runSplitPrepare(ctx context.Context, planPath, outDir, dir string) error {
 		return fmt.Errorf("write manifest: %w", err)
 	}
 	return nil
+}
+
+// preparePool writes the four artifact files for one recompose pool (diff,
+// name-status file list, parsed hunks, commit listing) and returns the manifest
+// entry describing them. Safe to call concurrently for distinct pools: every
+// path it writes is keyed by last.
+func preparePool(ctx context.Context, repo git.Repo, outDir, last string, shas []string) (poolPrepareEntry, error) {
+	diffPath := filepath.Join(outDir, last+".diff")
+	filesPath := filepath.Join(outDir, last+".files.txt")
+	hunksPath := filepath.Join(outDir, last+".hunks.json")
+	commitsPath := filepath.Join(outDir, last+".commits.txt")
+	entry := poolPrepareEntry{
+		LastSHA:     last,
+		DiffPath:    diffPath,
+		FilesPath:   filesPath,
+		HunksPath:   hunksPath,
+		CommitsPath: commitsPath,
+	}
+
+	var diffOut, filesOut, commitsOut string
+	if git.IsUncommitted(last) {
+		// The synthetic working-tree pool: its diff is `git diff HEAD` plus
+		// untracked files, not a commit range.
+		var err error
+		if diffOut, err = repo.UncommittedDiff(ctx); err != nil {
+			return entry, fmt.Errorf("uncommitted diff: %w", err)
+		}
+		files, err := repo.UncommittedFiles(ctx)
+		if err != nil {
+			return entry, fmt.Errorf("uncommitted files: %w", err)
+		}
+		lines := make([]string, 0, len(files))
+		for _, f := range files {
+			lines = append(lines, f.Status+"\t"+f.Path)
+		}
+		filesOut = strings.Join(lines, "\n") + "\n"
+		commitsOut = git.UncommittedSHA + " (uncommitted changes)\n"
+		entry.PoolSize = 0 // 0 marks "not a real pool"
+		entry.Commits = []string{git.UncommittedSHA}
+		entry.Subjects = []string{"(uncommitted changes)"}
+	} else {
+		oldest := shas[0]
+		parent, err := repo.Run(ctx, "rev-parse", oldest+"^")
+		if err != nil {
+			return entry, fmt.Errorf("resolve parent of %s: %w", oldest[:7], err)
+		}
+		parent = strings.TrimSpace(parent)
+		if diffOut, err = repo.Run(ctx, "diff", "--no-color", parent, last); err != nil {
+			return entry, fmt.Errorf("diff %s..%s: %w", parent[:7], last[:7], err)
+		}
+		if filesOut, err = repo.Run(ctx, "diff", "--name-status", parent, last); err != nil {
+			return entry, fmt.Errorf("diff name-status %s..%s: %w", parent[:7], last[:7], err)
+		}
+
+		bySHA := repo.Subjects(ctx, shas)
+		commitLines := make([]string, 0, len(shas))
+		subjects := make([]string, 0, len(shas))
+		for _, sha := range shas {
+			subj := bySHA[sha]
+			subjects = append(subjects, subj)
+			commitLines = append(commitLines, sha+" "+subj)
+		}
+		commitsOut = strings.Join(commitLines, "\n") + "\n"
+		entry.PoolSize = len(shas)
+		entry.Commits = shas
+		entry.Subjects = subjects
+	}
+
+	for _, f := range []struct {
+		what string
+		path string
+		body string
+	}{
+		{"diff", diffPath, diffOut},
+		{"files", filesPath, filesOut},
+		{"commits", commitsPath, commitsOut},
+	} {
+		if err := os.WriteFile(f.path, []byte(f.body), 0o600); err != nil {
+			return entry, fmt.Errorf("write %s: %w", f.what, err)
+		}
+	}
+	if err := writeHunksFile(hunksPath, diffOut); err != nil {
+		return entry, fmt.Errorf("write hunks: %w", err)
+	}
+	return entry, nil
 }
 
 func jsonMarshalIndent(v any) ([]byte, error) {
@@ -656,12 +693,9 @@ func loadPoolsFromSplits(dir string) ([]tui.ProposalPool, error) {
 			Groups:   groups,
 		})
 	}
-	// Stable sort by SHA.
-	for i := 1; i < len(pools); i++ {
-		for j := i; j > 0 && pools[j-1].SHA > pools[j].SHA; j-- {
-			pools[j-1], pools[j] = pools[j], pools[j-1]
-		}
-	}
+	slices.SortStableFunc(pools, func(a, b tui.ProposalPool) int {
+		return strings.Compare(a.SHA, b.SHA)
+	})
 	return pools, nil
 }
 
@@ -806,7 +840,8 @@ func rewordPrepareMain(args []string) error {
 		return fmt.Errorf("parse plan: %w", err)
 	}
 	repo := git.Repo{Dir: *dir}
-	ctx := context.Background()
+	ctx, cancel := prepareContext()
+	defer cancel()
 
 	var manifest []rewordManifestEntry
 	for _, op := range p.Ops {

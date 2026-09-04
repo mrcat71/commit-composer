@@ -117,9 +117,9 @@ func TestMarshalOutcomeIncludesPools(t *testing.T) {
 		t.Fatalf("MarshalOutcome: %v", err)
 	}
 	var parsed struct {
-		Accept       bool           `json:"accept"`
-		HasComments  bool           `json:"has_comments"`
-		Pools        []ProposalPool `json:"pools"`
+		Accept      bool           `json:"accept"`
+		HasComments bool           `json:"has_comments"`
+		Pools       []ProposalPool `json:"pools"`
 	}
 	if err := json.Unmarshal(data, &parsed); err != nil {
 		t.Fatalf("Unmarshal: %v\n%s", err, data)

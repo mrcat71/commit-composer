@@ -49,22 +49,20 @@ archives:
     files:
       - LICENSE
       - README.md
-      # Plugin files - copied to share/commit-composer/.claude-plugin so
-      # users can `/plugin marketplace add /opt/homebrew/share/commit-composer`.
-      # NOTE: .claude-plugin/bin/ is intentionally excluded - the launcher
-      # would otherwise prefer the bundled stale binary over the brew one.
+      # Plugin files - the archive reproduces the plugin root so users can
+      # `/plugin marketplace add /opt/homebrew/share/commit-composer`.
+      # NOTE: bin/ is intentionally excluded - the launcher would otherwise
+      # prefer the bundled stale binary over the brew-installed one.
       #
-      # Files are listed explicitly; goreleaser globs (`**/*`) interact
-      # poorly with hidden parent directories like `.claude-plugin/`, so
-      # globs would silently skip these files. Add new plugin files here.
+      # The two manifests must stay listed explicitly: goreleaser globs
+      # (`**/*`) interact poorly with hidden parent directories like
+      # `.claude-plugin/` and would silently skip them. skills/ and scripts/
+      # are ordinary directories, so globs work there.
       - .claude-plugin/marketplace.json
       - .claude-plugin/plugin.json
-      - .claude-plugin/commands/commit-compose.md
-      - .claude-plugin/commands/cc-commit.md
-      - .claude-plugin/skills/commit-composer/SKILL.md
-      - .claude-plugin/skills/cc-commit/SKILL.md
-      - .claude-plugin/scripts/launch-commit-composer.sh
-      - .claude-plugin/scripts/resolve-launcher.sh
+      - skills/**/*
+      - scripts/launch-commit-composer.sh
+      - scripts/resolve-launcher.sh
 
 checksum:
   name_template: checksums.txt
@@ -106,10 +104,12 @@ brews:
     install: |
       bin.install "commit-composer"
       # Ship the Claude Code plugin files so a single `brew install` gives
-      # users the binary AND the slash command / skill / launcher. The path
-      # `/opt/homebrew/share/commit-composer/.claude-plugin/` is stable across
-      # versions (brew refreshes the symlink on every upgrade), so users
+      # users the binary AND the skills / launcher. All three directories are
+      # required: the manifests live in .claude-plugin/, but Claude Code scans
+      # skills/ at the plugin root and the binary resolves its launcher from
+      # scripts/. The path `/opt/homebrew/share/commit-composer/` is stable
+      # across versions (brew refreshes the symlink on every upgrade), so users
       # only need to run `/plugin marketplace add` once.
-      (share/"commit-composer").install ".claude-plugin"
+      (share/"commit-composer").install ".claude-plugin", "skills", "scripts"
     test: |
       system "#{bin}/commit-composer", "--version"

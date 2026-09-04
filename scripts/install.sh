@@ -3,8 +3,7 @@
 # Claude plugin launcher can find it.
 #
 # Use this for local development. Production deployments should publish the
-# binary alongside the plugin (under .claude-plugin/bin/) so users don't need
-# a Go toolchain.
+# binary alongside the plugin (under bin/) so users don't need a Go toolchain.
 
 set -euo pipefail
 
@@ -16,7 +15,7 @@ if ! command -v go >/dev/null 2>&1; then
   exit 1
 fi
 
-OUT_DIR="${OUT_DIR:-$REPO_ROOT/.claude-plugin/bin}"
+OUT_DIR="${OUT_DIR:-$REPO_ROOT/bin}"
 mkdir -p "$OUT_DIR"
 
 printf 'building commit-composer -> %s\n' "$OUT_DIR/commit-composer"

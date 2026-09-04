@@ -26,11 +26,27 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+# resolve_repo_root echoes the directory holding go.mod, or nothing if there
+# isn't one (a Homebrew or plugin-cache install). Since 0.4 the plugin root IS
+# the repo root in a dev checkout; before that scripts/ lived under
+# .claude-plugin/, which put the repo one level further up.
+resolve_repo_root() {
+  local d
+  for d in "${PLUGIN_ROOT}" "${PLUGIN_ROOT}/.."; do
+    if [ -f "${d}/go.mod" ]; then
+      (cd "$d" && pwd)
+      return 0
+    fi
+  done
+  return 1
+}
+REPO_ROOT="$(resolve_repo_root || true)"
+
 # Locate the commit-composer binary. Preference order:
 #   1. $COMMIT_COMPOSER_BIN (explicit override)
-#   2. <plugin-root>/bin/commit-composer (bundled - copied here by install.sh)
+#   2. <plugin-root>/bin/commit-composer (bundled - built there by install.sh)
 #   3. $PATH lookup
-#   4. go run from <plugin-root>/.. (dev fallback - requires go toolchain)
+#   4. go run from the repo root (dev fallback - requires go toolchain)
 #
 # We check the plugin-bundled binary BEFORE $PATH so the launcher always uses
 # the binary that ships with the current plugin install rather than a stale
@@ -55,10 +71,10 @@ resolve_bin() {
 
 BIN="$(resolve_bin)"
 
-# If we fell through to `__dev_go_run__` AND there's no go.mod at the
-# plugin's parent dir, surface a clear error instead of silently failing
-# inside an overlay where the user can't see it.
-if [ "$BIN" = "__dev_go_run__" ] && [ ! -f "${PLUGIN_ROOT}/../go.mod" ]; then
+# If we fell through to `__dev_go_run__` AND we never found a go.mod, surface a
+# clear error instead of silently failing inside an overlay where the user
+# can't see it.
+if [ "$BIN" = "__dev_go_run__" ] && [ -z "$REPO_ROOT" ]; then
   cat >&2 <<EOF
 commit-composer: cannot locate the binary.
 
@@ -66,7 +82,7 @@ Checked (in order):
   \$COMMIT_COMPOSER_BIN  = ${COMMIT_COMPOSER_BIN:-(unset)}
   ${PLUGIN_ROOT}/bin/commit-composer
   \`command -v commit-composer\`
-  \`go run\` fallback at ${PLUGIN_ROOT}/.. (no go.mod found)
+  \`go run\` fallback in ${PLUGIN_ROOT} and ${PLUGIN_ROOT}/.. (no go.mod found)
 
 To fix:
   1. cd /path/to/commit-composer && ./scripts/install.sh
@@ -112,9 +128,7 @@ build_cmd() {
 
   local binexpr
   if [ "$BIN" = "__dev_go_run__" ]; then
-    local repo_root
-    repo_root="$(cd "${PLUGIN_ROOT}/.." && pwd)"
-    binexpr=$(printf 'cd %q && go run ./cmd/commit-composer' "$repo_root")
+    binexpr=$(printf 'cd %q && go run ./cmd/commit-composer' "$REPO_ROOT")
   else
     binexpr=$(printf '%q' "$BIN")
   fi

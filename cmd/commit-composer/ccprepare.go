@@ -1,12 +1,12 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/mrcat71/commit-composer/internal/git"
 	"github.com/mrcat71/commit-composer/internal/plan"
@@ -30,6 +30,10 @@ import (
 //	PLAN_FILE=/tmp/cc-commit-plan-...      # synthesized WORKING plan
 //	SPLITS_DIR=/tmp/cc-commit-splits-...
 //	FILES=/tmp/cc-commit-splits-.../WORKING.files.txt
+//	--- BEGIN FILES ---                    # inline copy of FILES, see printFileList
+//	M	internal/git/git.go
+//	A	docs/new.md
+//	--- END FILES ---
 //
 // Temp files are intentionally left on disk (the user inspects them after a
 // run; see the no-auto-rm rule in the slash command).
@@ -45,7 +49,8 @@ func ccPrepareMain(args []string) error {
 	}
 
 	repo := git.Repo{Dir: *dir}
-	ctx := context.Background()
+	ctx, cancel := prepareContext()
+	defer cancel()
 
 	if _, err := repo.Run(ctx, "rev-parse", "--git-dir"); err != nil {
 		return errors.New("not in a git repository")
@@ -87,5 +92,38 @@ func ccPrepareMain(args []string) error {
 	filesPath := filepath.Join(splitsDir, git.UncommittedSHA+".files.txt")
 	fmt.Printf("DIRTY=yes\nPLAN_FILE=%s\nSPLITS_DIR=%s\nFILES=%s\n",
 		planFile.Name(), splitsDir, filesPath)
+	printFileList(filesPath)
 	return nil
+}
+
+// maxInlineFiles caps the inline name-status dump. The list is echoed so the
+// /cc-commit skill can decide its commit grouping straight from this command's
+// output; past a few hundred files that stops being a saving and turns into a
+// context dump, so the caller reads FILES itself instead.
+const maxInlineFiles = 300
+
+// printFileList echoes the name-status lines between markers, so a caller that
+// injects this command's output into a prompt already has the file list and does
+// not need a follow-up read. Best-effort: FILES stays on disk either way, and
+// the markers are omitted entirely when it cannot be read.
+func printFileList(path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	body := strings.TrimRight(string(data), "\n")
+	if body == "" {
+		return
+	}
+	lines := strings.Split(body, "\n")
+	if len(lines) > maxInlineFiles {
+		// No markers - their absence is the signal to read FILES.
+		fmt.Printf("FILES_TRUNCATED=%d\n", len(lines))
+		return
+	}
+	fmt.Println("--- BEGIN FILES ---")
+	for _, line := range lines {
+		fmt.Println(line)
+	}
+	fmt.Println("--- END FILES ---")
 }

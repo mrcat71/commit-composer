@@ -129,13 +129,6 @@ func (m *Model) resetDiffViewport() {
 	m.lastDiffSHA = ""
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 // ensureCursorVisible adjusts listOffset edge-triggered: only when the cursor
 // would otherwise fall outside the current viewport. Vim-style scrolling.
 func (m *Model) ensureCursorVisible() {

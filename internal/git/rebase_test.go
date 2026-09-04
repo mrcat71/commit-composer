@@ -3,11 +3,13 @@ package git
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/mrcat71/commit-composer/internal/plan"
@@ -141,18 +143,55 @@ func TestRewordMessages(t *testing.T) {
 	}
 }
 
-// buildSelf compiles the commit-composer binary into the test's temp dir and
-// returns its absolute path. Skips the test if go is missing.
+// errGoToolchainMissing marks the one build failure that should skip rather
+// than fail: no go binary on PATH.
+var errGoToolchainMissing = errors.New("go toolchain not available")
+
+// sharedBinDir is the directory sharedBinary built into, kept so TestMain can
+// remove it once every test has finished with the binary.
+var sharedBinDir string
+
+// sharedBinary compiles the commit-composer binary once per package run and
+// hands the same path to every caller. The end-to-end tests below each drive
+// the real binary as a subprocess; building it per test cost a link and a
+// process spawn ten times over and dominated the whole suite's runtime.
+var sharedBinary = sync.OnceValues(func() (string, error) {
+	if _, err := exec.LookPath("go"); err != nil {
+		return "", errGoToolchainMissing
+	}
+	dir, err := os.MkdirTemp("", "commit-composer-test-bin")
+	if err != nil {
+		return "", fmt.Errorf("temp dir for test binary: %w", err)
+	}
+	sharedBinDir = dir
+	bin := filepath.Join(dir, "commit-composer")
+	out, err := exec.Command("go", "build", "-o", bin, "github.com/mrcat71/commit-composer/cmd/commit-composer").CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("go build commit-composer: %w\n%s", err, out)
+	}
+	return bin, nil
+})
+
+func TestMain(m *testing.M) {
+	code := m.Run()
+	// Safe to read without synchronisation: every write happened inside the
+	// sync.OnceValues call, and m.Run has returned, so all tests are done.
+	if sharedBinDir != "" {
+		_ = os.RemoveAll(sharedBinDir)
+	}
+	os.Exit(code)
+}
+
+// buildSelf returns the path to the commit-composer binary, compiling it on the
+// first call. Skips the test if go is missing.
 func buildSelf(t *testing.T) string {
 	t.Helper()
-	if _, err := exec.LookPath("go"); err != nil {
+	bin, err := sharedBinary()
+	if errors.Is(err, errGoToolchainMissing) {
 		t.Skip("go toolchain not available")
 	}
-	bin := filepath.Join(t.TempDir(), "commit-composer")
-	cmd := exec.Command("go", "build", "-o", bin, "github.com/mrcat71/commit-composer/cmd/commit-composer")
-	out, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("go build commit-composer: %v\n%s", err, out)
+		t.Fatal(err)
 	}
 	return bin
 }
@@ -164,6 +203,7 @@ func TestApplyEndToEndClaudeSplit(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
+	t.Parallel()
 	r := testRepo(t, 2) // c1, c2
 	ctx := context.Background()
 
@@ -260,6 +300,7 @@ func TestApplyClaudeRecomposePool(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
+	t.Parallel()
 	r := testRepo(t, 1) // c1
 	ctx := context.Background()
 
@@ -339,6 +380,7 @@ func TestApplyUncommittedOnly(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
+	t.Parallel()
 	r := testRepo(t, 1) // c1, then we'll dirty the tree
 	ctx := context.Background()
 
@@ -403,6 +445,7 @@ func TestApplyUncommittedHunks(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
+	t.Parallel()
 	r := testRepo(t, 1)
 	ctx := context.Background()
 
@@ -495,6 +538,7 @@ func TestApplyClaudeSplitMissingJSONFailsEarly(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
+	t.Parallel()
 	r := testRepo(t, 2)
 	ctx := context.Background()
 	headSHA, _ := r.RevParse(ctx, "HEAD")
@@ -527,6 +571,7 @@ func TestApplyEndToEndPureSquash(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
+	t.Parallel()
 	r := testRepo(t, 3) // c1, c2, c3
 	ctx := context.Background()
 	base, _, _, err := r.ResolveRange(ctx, "HEAD~2")
@@ -585,6 +630,7 @@ func TestApplyEndToEndEditPausesForUser(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
+	t.Parallel()
 	r := testRepo(t, 3)
 	ctx := context.Background()
 	base, _, _, err := r.ResolveRange(ctx, "HEAD~2")
@@ -634,6 +680,7 @@ func TestApplyEndToEndReorder(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
+	t.Parallel()
 	r := testRepo(t, 4) // c1, c2, c3, c4
 	ctx := context.Background()
 	// Touch different files so c2 and c3 don't conflict when reordered.
@@ -687,6 +734,7 @@ func TestApplyEndToEndSquash(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
+	t.Parallel()
 	r := testRepo(t, 4)
 	ctx := context.Background()
 	base, head, _, err := r.ResolveRange(ctx, "HEAD~3")
@@ -740,6 +788,7 @@ func TestApplyEndToEnd(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
+	t.Parallel()
 	r := testRepo(t, 4) // c1, c2, c3, c4
 	ctx := context.Background()
 	base, head, _, err := r.ResolveRange(ctx, "HEAD~3")

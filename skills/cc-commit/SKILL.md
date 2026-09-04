@@ -1,11 +1,14 @@
 ---
 description: Fast-commit the working tree. Claude analyses the dirty diff, splits it into 1+ Conventional-Commits-style commits, and applies autonomously. No TUI. Falls back to /commit-compose when the tree is clean.
+when_to_use: The user wants their current uncommitted changes committed for them, quickly and without a TUI - "commit my changes", "commit this", "fast commit", "just commit it", "commit the working tree", "split my changes into commits". Use for uncommitted work; for rewriting commits that already exist use commit-compose instead.
 argument-hint: 'optional: free-text hint, e.g. "keep tests separate"'
 model: sonnet
-# effort: low   # uncomment to trade a little grouping/scope quality for more speed
+# This is the fast action: the user picked it over /commit-compose precisely to
+# trade some grouping/scope deliberation for latency.
+effort: low
 allowed-tools:
   - Bash(commit-composer *)
-  - Bash(${CLAUDE_PLUGIN_ROOT}/.claude-plugin/bin/commit-composer *)
+  - Bash(${CLAUDE_PLUGIN_ROOT}/bin/commit-composer *)
   - Bash(git *)
   - Read
   - Write
@@ -35,20 +38,20 @@ not found, tell the user to run `./scripts/install.sh` and stop.
 
 ## Commit-message rules
 
-Every commit message you propose MUST follow the **Commit-message
-rules** documented at the top of
-`${CLAUDE_PLUGIN_ROOT}/.claude-plugin/commands/commit-compose.md` -
+Every commit message you propose MUST follow the rules in
+`${CLAUDE_PLUGIN_ROOT}/skills/commit-compose/references/commit-message-rules.md` -
 Conventional Commits format, specific feature/module/service scope (not
 generic technology scopes), imperative lowercase summary, no trailing
 period, max 72 characters, kebab-case scope when multi-word.
 
-The scope-selection cheatsheet is the load-bearing part: ask "what is
-this change ABOUT?" and use that as the scope. The technology is just
+Read that file before writing any message. The scope-selection
+cheatsheet at the end of it is the load-bearing part: ask "what is this
+change ABOUT?" and use the answer as the scope. The technology is just
 the tool the change happens to use.
 
 ## Argument
 
-`$1` is an **optional free-text hint** that steers Claude's grouping
+`$ARGUMENTS` is an **optional free-text hint** that steers Claude's grouping
 or message style. Examples:
 
 - `/cc-commit` - pure auto.
@@ -68,18 +71,23 @@ in a single chat line.
 The user has explicitly asked for this to be a fast action. Do NOT run
 diagnostic bash commands (env dumps, version checks, `git status`,
 etc.). Do NOT narrate "let me check ...". Do NOT print the full diff
-in chat. Read the artifacts on disk, write the proposal JSON, apply.
+in chat.
 
-## 1. Pre-flight + prepare (one command)
+The prepare step already ran at load time (section 1), so the intended
+shape is **two tool calls total**: one `Write` of the proposal JSON,
+one `Bash` apply. Anything more than that is you re-fetching something
+you already have.
 
-Run exactly one command to detect the tree state and prepare the
-analysis artifacts:
+## 1. Pre-flight + prepare (already done)
 
-```bash
-commit-composer __cc-prepare
+The prepare step ran while this skill was loading. Its output:
+
+```!
+commit-composer __cc-prepare || true
 ```
 
-It prints `KEY=value` lines. Parse them:
+Do **not** run `__cc-prepare` again - everything it produces is in the
+block above. Parse it:
 
 - `DIRTY=no` - the working tree is clean; **switch to the
   `/commit-compose` flow** (see 1a). Nothing else is printed.
@@ -88,6 +96,11 @@ It prints `KEY=value` lines. Parse them:
   - `SPLITS_DIR=<path>` - directory holding the analysis artifacts.
   - `FILES=<path>`      - name-status lines for every dirty file
     (staged + unstaged + untracked).
+  - `--- BEGIN FILES ---` / `--- END FILES ---` - those name-status
+    lines inline. When the markers are present you have the full file
+    list already; do **not** `Read` the `FILES` path. Only if
+    `FILES_TRUNCATED=<n>` appears instead (more than 300 dirty files)
+    do you read `FILES` yourself.
 
 `__cc-prepare` also wrote, under `SPLITS_DIR`:
 
@@ -96,15 +109,14 @@ It prints `KEY=value` lines. Parse them:
   hunk-level splits).
 - `manifest.json`  - structured pool list (one `WORKING` entry).
 
-If the command errors (e.g. not a git repo), surface the error and
-stop.
+If the block shows a `commit-composer:` error instead (not a git repo,
+binary missing), surface that one line and stop.
 
 ### 1a. Clean-tree fallback
 
-On `DIRTY=no` the working tree has nothing to fast-commit. Read the
-file at
-`${CLAUDE_PLUGIN_ROOT}/.claude-plugin/commands/commit-compose.md`
-and follow it from step 1 onward, passing the user's `$1` through as
+On `DIRTY=no` the working tree has nothing to fast-commit. Read
+`${CLAUDE_PLUGIN_ROOT}/skills/commit-compose/SKILL.md` and follow it
+from its launch step onward, passing the user's `$ARGUMENTS` through as
 the range argument. Do NOT duplicate that flow inline here.
 
 Print one line of chat acknowledging the fallback (e.g. "working tree
@@ -112,11 +124,11 @@ clean, opening the commit-compose TUI instead") and continue.
 
 ## 2. Propose groups
 
-Read the `FILES` path. **Start with filenames**: if the file paths make
-the topical boundary obvious (e.g. a CI workflow file + a Dockerfile +
-an unrelated README change), you can group without reading the diff at
-all. Reading the full diff is the single biggest token sink in this
-workflow.
+**Start with the filenames from the injected `FILES` block**: if the
+paths make the topical boundary obvious (e.g. a CI workflow file + a
+Dockerfile + an unrelated README change), you can group without reading
+anything else at all. Reading the full diff is the single biggest token
+sink in this workflow.
 
 Only read `SPLITS_DIR/WORKING.diff` when:
 
@@ -124,7 +136,7 @@ Only read `SPLITS_DIR/WORKING.diff` when:
   *what* changed to decide grouping.
 - Filenames are generic (`utils.go`, `helpers.py`) and don't reveal
   the topic.
-- The user's `$1` hint requires understanding the content.
+- The user's `$ARGUMENTS` hint requires understanding the content.
 
 **Decide on 1+ groups.** Output count is YOUR judgment - 1, 2, 5, or
 more are all valid. Decide from the diff, not from a fixed number:
@@ -133,7 +145,7 @@ more are all valid. Decide from the diff, not from a fixed number:
 - Two unrelated topics in the dirty tree -> 2 groups.
 - An unrelated docs tweak alongside a feature -> split it out.
 
-Factor in the user's `$1` hint when non-empty.
+Factor in the user's `$ARGUMENTS` hint when non-empty.
 
 **Every file** the dirty tree touches must appear in **exactly one**
 group's `files` array. The binary fails the apply if anything is left

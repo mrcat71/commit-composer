@@ -11,7 +11,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -55,10 +59,22 @@ type Repo struct {
 // Run executes `git <args...>` inside r.Dir and returns combined stdout.
 // stderr is folded into the returned error on failure.
 func (r Repo) Run(ctx context.Context, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, "git", args...)
+	return r.runEnv(ctx, nil, args...)
+}
+
+// runEnv is Run with extra "K=V" entries layered over the inherited
+// environment. Used to point git at a scratch index via GIT_INDEX_FILE.
+func (r Repo) runEnv(ctx context.Context, extraEnv []string, args ...string) (string, error) {
+	// --no-optional-locks stops read-only commands from taking the index lock,
+	// so inspecting a repo never contends with a git the user is running in it.
+	cmd := exec.CommandContext(ctx, "git", append([]string{"--no-optional-locks"}, args...)...)
 	if r.Dir != "" {
 		cmd.Dir = r.Dir
 	}
+	// LC_ALL=C pins git's own messages to English; every parser in this package
+	// and every error-classifying helper (isUnknownRef) assumes that.
+	cmd.Env = append(os.Environ(), "LC_ALL=C")
+	cmd.Env = append(cmd.Env, extraEnv...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -66,6 +82,19 @@ func (r Repo) Run(ctx context.Context, args ...string) (string, error) {
 		return stdout.String(), fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
 	}
 	return stdout.String(), nil
+}
+
+// nonEmptyLines splits git output on newlines, dropping blank lines and any
+// trailing \r. git emits a trailing newline on almost every command, so a naive
+// Split leaves an empty final element.
+func nonEmptyLines(s string) []string {
+	var out []string
+	for _, line := range strings.Split(s, "\n") {
+		if line = strings.TrimRight(line, "\r"); line != "" {
+			out = append(out, line)
+		}
+	}
+	return out
 }
 
 // RevParse resolves a revision (branch / SHA / HEAD~N / etc) to a full SHA.
@@ -270,6 +299,45 @@ func (r Repo) Log(ctx context.Context, base, head string) ([]Commit, error) {
 	return commits, nil
 }
 
+// Subjects maps each given SHA to its commit subject in one `git log` call.
+//
+// Best-effort: SHAs git could not resolve are simply absent from the result, and
+// a total failure returns an empty map rather than an error. Both call sites use
+// subjects decoratively (todo-file comments, pool listings), so a missing one
+// must never fail the operation.
+func (r Repo) Subjects(ctx context.Context, shas []string) map[string]string {
+	subjects := make(map[string]string, len(shas))
+	if len(shas) == 0 {
+		return subjects
+	}
+	// --no-walk restricts output to exactly the named commits instead of
+	// traversing their history. Trailing "--" keeps a SHA that also names a file
+	// from being read as a pathspec.
+	args := append([]string{"log", "--no-walk", "--format=%H %s"}, shas...)
+	args = append(args, "--")
+	out, err := r.Run(ctx, args...)
+	if err != nil {
+		// One unresolvable SHA fails the whole batch, so fall back to per-SHA
+		// lookups to salvage the rest. Only reachable if the plan references a
+		// commit that has since disappeared.
+		for _, sha := range shas {
+			if one, err := r.Run(ctx, "log", "-1", "--format=%s", sha); err == nil {
+				subjects[sha] = strings.TrimSpace(one)
+			}
+		}
+		return subjects
+	}
+	for _, line := range nonEmptyLines(out) {
+		sha, subject, ok := strings.Cut(line, " ")
+		if !ok {
+			// A commit with an empty subject prints just the SHA.
+			sha, subject = line, ""
+		}
+		subjects[sha] = subject
+	}
+	return subjects
+}
+
 // Files returns the name-status entries touched by a commit.
 //
 // Uses `git diff-tree --root` so the root commit reports its files as added
@@ -298,41 +366,129 @@ func (r Repo) Files(ctx context.Context, sha string) ([]FileStat, error) {
 	return files, nil
 }
 
+// maxPathsPerCall caps how many pathspecs go into one `git add`, so a repo with
+// a huge untracked set can't overflow the OS argument limit.
+const maxPathsPerCall = 512
+
+// scratchIndex copies the repo's index to a temp file and returns its path plus
+// a cleanup func. Staging into the copy via GIT_INDEX_FILE lets a read-only
+// operation use `git add` without ever touching the index the user is working
+// in - so an interrupted run can't leave entries behind.
+func (r Repo) scratchIndex(ctx context.Context) (string, func(), error) {
+	out, err := r.Run(ctx, "rev-parse", "--git-path", "index")
+	if err != nil {
+		return "", nil, fmt.Errorf("locate index: %w", err)
+	}
+	realIndex := strings.TrimSpace(out)
+	if r.Dir != "" && !filepath.IsAbs(realIndex) {
+		realIndex = filepath.Join(r.Dir, realIndex)
+	}
+
+	tmp, err := os.CreateTemp("", "commit-composer-index")
+	if err != nil {
+		return "", nil, fmt.Errorf("scratch index: %w", err)
+	}
+	cleanup := func() { _ = os.Remove(tmp.Name()) }
+
+	src, err := os.Open(realIndex)
+	if err != nil {
+		// A repo with no commits and nothing staged has no index file yet.
+		// Leaving the scratch file empty is fine - git writes a fresh index
+		// into it, which is exactly the empty state we'd have copied.
+		_ = tmp.Close()
+		if os.IsNotExist(err) {
+			return tmp.Name(), cleanup, nil
+		}
+		cleanup()
+		return "", nil, fmt.Errorf("read index %s: %w", realIndex, err)
+	}
+	_, copyErr := io.Copy(tmp, src)
+	_ = src.Close()
+	if closeErr := tmp.Close(); copyErr == nil {
+		copyErr = closeErr
+	}
+	if copyErr != nil {
+		cleanup()
+		return "", nil, fmt.Errorf("copy index: %w", copyErr)
+	}
+	return tmp.Name(), cleanup, nil
+}
+
+// readableUntracked drops paths git would fail to hash. `git add -N` accepts an
+// unreadable file (intent-to-add never reads the content), but the following
+// `git diff` has to hash the working-tree blob and aborts the entire diff with
+// "fatal: cannot hash <path>" - losing every other file's changes along with it.
+// Filtering here costs one stat/open per untracked path and no subprocesses.
+func (r Repo) readableUntracked(paths []string) []string {
+	keep := make([]string, 0, len(paths))
+	for _, p := range paths {
+		full := p
+		if r.Dir != "" {
+			full = filepath.Join(r.Dir, p)
+		}
+		// git hashes a symlink's target string rather than reading through it,
+		// so a symlink is always fine - and opening one would follow it and
+		// wrongly reject a dangling link.
+		if fi, err := os.Lstat(full); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+			keep = append(keep, p)
+			continue
+		}
+		f, err := os.Open(full)
+		if err != nil {
+			continue
+		}
+		_ = f.Close()
+		keep = append(keep, p)
+	}
+	return keep
+}
+
 // UncommittedDiff returns the combined diff of staged + unstaged + untracked
-// changes vs HEAD as a single patch. Tracked changes use `git diff HEAD --
-// <paths>`; untracked files are added via `git add -N` (intent-to-add) so
-// `git diff` includes them as full additions, then immediately reset so the
-// index isn't actually mutated.
+// changes vs HEAD as a single patch.
+//
+// Untracked files only show up in `git diff` once they have an index entry, so
+// they are staged with `git add -N` (intent-to-add) against a throwaway copy of
+// the index. The user's real index is never written to.
 //
 // The returned patch can be fed to Claude the same way a commit diff is.
 func (r Repo) UncommittedDiff(ctx context.Context) (string, error) {
-	// Capture intent-to-add state so we can restore it.
-	untracked, err := r.Run(ctx, "ls-files", "--others", "--exclude-standard")
+	out, err := r.Run(ctx, "ls-files", "--others", "--exclude-standard")
 	if err != nil {
 		return "", fmt.Errorf("list untracked: %w", err)
 	}
-	var addedIntent []string
-	for _, p := range strings.Split(strings.TrimRight(untracked, "\n"), "\n") {
-		if p == "" {
-			continue
+	untracked := r.readableUntracked(nonEmptyLines(out))
+	if len(untracked) == 0 {
+		diff, err := r.Run(ctx, "diff", "--no-color", "HEAD")
+		if err != nil {
+			return "", fmt.Errorf("git diff HEAD: %w", err)
 		}
-		if _, err := r.Run(ctx, "add", "-N", "--", p); err != nil {
-			// If intent-to-add fails for one path, skip it but keep going.
-			continue
-		}
-		addedIntent = append(addedIntent, p)
+		return diff, nil
 	}
-	defer func() {
-		// `git reset HEAD -- <path>` removes the intent-to-add entry.
-		for _, p := range addedIntent {
-			_, _ = r.Run(context.Background(), "reset", "HEAD", "--", p)
+
+	index, cleanup, err := r.scratchIndex(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer cleanup()
+	env := []string{"GIT_INDEX_FILE=" + index}
+
+	for chunk := range slices.Chunk(untracked, maxPathsPerCall) {
+		args := append([]string{"add", "-N", "--"}, chunk...)
+		if _, err := r.runEnv(ctx, env, args...); err == nil {
+			continue
 		}
-	}()
-	out, err := r.Run(ctx, "diff", "--no-color", "HEAD")
+		// One bad path (vanished mid-run, unreadable) fails the whole chunk.
+		// Retry individually so the rest still make it into the diff.
+		for _, p := range chunk {
+			_, _ = r.runEnv(ctx, env, "add", "-N", "--", p)
+		}
+	}
+
+	diff, err := r.runEnv(ctx, env, "diff", "--no-color", "HEAD")
 	if err != nil {
 		return "", fmt.Errorf("git diff HEAD: %w", err)
 	}
-	return out, nil
+	return diff, nil
 }
 
 // UncommittedFiles returns the name-status entries for every file in the
@@ -446,28 +602,41 @@ func (r Repo) ParentOrEmpty(ctx context.Context, sha string, n int) (string, err
 // CommitsContainedIn reports which of the given SHAs are reachable from ref.
 // Used by the slash command's safety check to refuse rebasing commits that are
 // already published to a protected branch.
+//
+// Returns an empty map (not an error) when ref does not exist, e.g. a repo with
+// no origin/main: nothing is published, so nothing needs protecting.
 func (r Repo) CommitsContainedIn(ctx context.Context, ref string, shas []string) (map[string]bool, error) {
 	contained := make(map[string]bool, len(shas))
 	if len(shas) == 0 {
 		return contained, nil
 	}
-	for _, sha := range shas {
-		out, err := r.Run(ctx, "merge-base", "--is-ancestor", sha, ref)
-		if err != nil {
-			// `--is-ancestor` exits 1 if not an ancestor; treat that as "not contained".
-			var exitErr *exec.ExitError
-			if errors.As(errors.Unwrap(err), &exitErr) && exitErr.ExitCode() == 1 {
-				contained[sha] = false
-				continue
-			}
-			// The ref may simply not exist (no origin/main). Skip silently.
-			if isUnknownRef(out) {
-				return contained, nil
-			}
-			contained[sha] = false
-			continue
+	// One rev-list instead of a merge-base per SHA. Anything it prints is NOT
+	// reachable from ref; every input absent from the output is. The output can
+	// include ancestors of the non-contained SHAs too, so only look up the SHAs
+	// we asked about.
+	args := append([]string{"rev-list"}, shas...)
+	args = append(args, "--not", ref)
+	out, err := r.Run(ctx, args...)
+	if err != nil {
+		// git reports a missing ref on stderr, which Run folds into the error.
+		if isUnknownRef(err.Error()) {
+			return contained, nil
 		}
-		contained[sha] = true
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			// Some other rev-list failure. Report nothing as contained: the
+			// safety check will let the rebase proceed rather than block on an
+			// answer we don't have.
+			return contained, nil
+		}
+		return nil, fmt.Errorf("rev-list %s: %w", ref, err)
+	}
+	notContained := make(map[string]bool, len(shas))
+	for _, sha := range nonEmptyLines(out) {
+		notContained[sha] = true
+	}
+	for _, sha := range shas {
+		contained[sha] = !notContained[sha]
 	}
 	return contained, nil
 }

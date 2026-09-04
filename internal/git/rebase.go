@@ -233,16 +233,13 @@ func (r Repo) Apply(ctx context.Context, p plan.Plan, opts ApplyOptions) error {
 	}
 	p.Ops = rebaseOps
 
-	// Collect subjects for the todo file's trailing comment column.
-	subjects := make(map[string]string, len(p.Ops))
-	for _, op := range p.Ops {
-		// Best-effort: read the subject. Failure is non-fatal; the comment
-		// column is decorative.
-		out, err := r.Run(ctx, "log", "-1", "--format=%s", op.SHA)
-		if err == nil {
-			subjects[op.SHA] = strings.TrimSpace(out)
-		}
+	// Collect subjects for the todo file's trailing comment column. Best-effort:
+	// the comment column is decorative, so Subjects swallows lookup failures.
+	opSHAs := make([]string, len(p.Ops))
+	for i, op := range p.Ops {
+		opSHAs[i] = op.SHA
 	}
+	subjects := r.Subjects(ctx, opSHAs)
 
 	stage, err := os.MkdirTemp("", "commit-composer-rebase-")
 	if err != nil {

@@ -69,7 +69,7 @@ M1-M4 implementation session.
 
 - [ ] Wire `scripts/install.sh` into `make install` for parity with the
   Go convention; keep the bash script for non-make users.
-- [ ] Decide on prebuilt binaries: ship `.claude-plugin/bin/<os>/<arch>`
+- [ ] Decide on prebuilt binaries: ship `bin/<os>/<arch>`
   via GitHub releases so users without a Go toolchain can install via
   marketplace alone. Currently install requires `go build`.
 - [ ] Submit to a public Claude Code plugin marketplace once verified.

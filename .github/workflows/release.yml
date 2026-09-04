@@ -31,8 +31,8 @@ jobs:
         with:
           # Keep in sync with the `go` directive in go.mod. setup-go pins
           # GOTOOLCHAIN=local, so a mismatch here blocks goreleaser's
-          # `go mod tidy` hook with "go.mod requires go >= 1.25.0".
-          go-version: "1.25"
+          # `go mod tidy` hook with "go.mod requires go >= 1.27.0".
+          go-version: "1.27"
           check-latest: true
 
       - name: Run goreleaser

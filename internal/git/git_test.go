@@ -64,6 +64,7 @@ func itoa(i int) string {
 }
 
 func TestRevParseAndIsClean(t *testing.T) {
+	t.Parallel()
 	r := testRepo(t, 2)
 	ctx := context.Background()
 
@@ -97,6 +98,7 @@ func TestRevParseAndIsClean(t *testing.T) {
 }
 
 func TestResolveRange(t *testing.T) {
+	t.Parallel()
 	// 30 commits so the default-depth (25) fallback resolves.
 	r := testRepo(t, 30)
 	ctx := context.Background()
@@ -142,6 +144,7 @@ func TestResolveRange(t *testing.T) {
 // (empty-tree sentinel) and head=HEAD so Log/Diff/Apply can fall back to
 // the empty tree as parent.
 func TestResolveRangeSingleCommit(t *testing.T) {
+	t.Parallel()
 	r := testRepo(t, 1)
 	ctx := context.Background()
 
@@ -177,6 +180,7 @@ func TestResolveRangeNoCommits(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
+	t.Parallel()
 	dir := t.TempDir()
 	r := Repo{Dir: dir}
 	ctx := context.Background()
@@ -237,6 +241,7 @@ func TestResolveRangeDefaultWithMergeCommits(t *testing.T) {
 // default range should fall through to HEAD~N..HEAD instead of erroring on
 // an empty upstream..HEAD range.
 func TestResolveRangeSyncedBranch(t *testing.T) {
+	t.Parallel()
 	r := testRepo(t, 5)
 	ctx := context.Background()
 	// Fake an upstream by creating a remote-tracking ref at HEAD and wiring
@@ -269,6 +274,7 @@ func TestResolveRangeSyncedBranch(t *testing.T) {
 // default range to expand to the recent-N window for context rather than
 // hand the user a single-row TUI. See minUpstreamCommitsForDefault.
 func TestResolveRangeJustAheadOfUpstream(t *testing.T) {
+	t.Parallel()
 	r := testRepo(t, 5)
 	ctx := context.Background()
 	// Point the fake upstream one commit behind HEAD so cnt(upstream..HEAD) == 1.
@@ -300,6 +306,7 @@ func TestResolveRangeJustAheadOfUpstream(t *testing.T) {
 }
 
 func TestLogOrderAndFields(t *testing.T) {
+	t.Parallel()
 	r := testRepo(t, 4) // need a parent for HEAD~3
 	ctx := context.Background()
 	base, head, _, err := r.ResolveRange(ctx, "HEAD~3")
@@ -335,6 +342,7 @@ func TestLogOrderAndFields(t *testing.T) {
 }
 
 func TestFilesAndDiff(t *testing.T) {
+	t.Parallel()
 	r := testRepo(t, 1)
 	ctx := context.Background()
 	sha, err := r.RevParse(ctx, "HEAD")
@@ -358,38 +366,279 @@ func TestFilesAndDiff(t *testing.T) {
 }
 
 func TestCommitsContainedIn(t *testing.T) {
+	t.Parallel()
 	r := testRepo(t, 3)
 	ctx := context.Background()
 
-	// Create a branch pointing at HEAD~1 to act as "protected".
+	// A branch pointing at HEAD~1 acts as the "protected" ref: it contains
+	// HEAD~1 and HEAD~2 but not HEAD.
 	if _, err := r.Run(ctx, "branch", "protected", "HEAD~1"); err != nil {
 		t.Fatalf("create branch: %v", err)
 	}
-	headSHA, _ := r.RevParse(ctx, "HEAD")
-	headMinus1, _ := r.RevParse(ctx, "HEAD~1")
-	headMinus2, _ := r.RevParse(ctx, "HEAD~2")
+	sha := func(rev string) string {
+		t.Helper()
+		s, err := r.RevParse(ctx, rev)
+		if err != nil {
+			t.Fatalf("RevParse %s: %v", rev, err)
+		}
+		return s
+	}
+	head, head1, head2 := sha("HEAD"), sha("HEAD~1"), sha("HEAD~2")
 
-	got, err := r.CommitsContainedIn(ctx, "protected", []string{headSHA, headMinus1, headMinus2})
-	if err != nil {
-		t.Fatalf("CommitsContainedIn: %v", err)
+	tests := []struct {
+		name string
+		ref  string
+		revs []string
+		want map[string]bool
+	}{
+		{"all contained", "protected", []string{head1, head2}, map[string]bool{head1: true, head2: true}},
+		{"none contained", "protected", []string{head}, map[string]bool{head: false}},
+		{"mixed", "protected", []string{head, head1, head2}, map[string]bool{head: false, head1: true, head2: true}},
+		{"ref is head itself", "main", []string{head, head1, head2}, map[string]bool{head: true, head1: true, head2: true}},
+		{"empty input", "protected", nil, map[string]bool{}},
+		// A missing ref means nothing is published, so nothing is contained.
+		// It must not surface as an error - the caller treats an error as
+		// "skip this ref" and we want the same answer either way.
+		{"unknown ref", "origin/does-not-exist", []string{head, head1}, map[string]bool{}},
 	}
-	if got[headSHA] {
-		t.Errorf("HEAD should NOT be in protected, got contained=true")
-	}
-	if !got[headMinus1] || !got[headMinus2] {
-		t.Errorf("HEAD~1 and HEAD~2 should be in protected, got %+v", got)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := r.CommitsContainedIn(ctx, tc.ref, tc.revs)
+			if err != nil {
+				t.Fatalf("CommitsContainedIn: %v", err)
+			}
+			if len(got) != len(tc.want) {
+				t.Fatalf("got %d entries %+v, want %d %+v", len(got), got, len(tc.want), tc.want)
+			}
+			for s, want := range tc.want {
+				if got[s] != want {
+					t.Errorf("%s: contained=%v want %v", s[:8], got[s], want)
+				}
+			}
+		})
 	}
 }
 
-func TestCommitsContainedInUnknownRef(t *testing.T) {
+func TestSubjects(t *testing.T) {
+	t.Parallel()
+	r := testRepo(t, 3)
+	ctx := context.Background()
+	sha := func(rev string) string {
+		t.Helper()
+		s, err := r.RevParse(ctx, rev)
+		if err != nil {
+			t.Fatalf("RevParse %s: %v", rev, err)
+		}
+		return s
+	}
+	c3, c2, c1 := sha("HEAD"), sha("HEAD~1"), sha("HEAD~2")
+	missing := strings.Repeat("0", 40)
+
+	tests := []struct {
+		name string
+		in   []string
+		want map[string]string
+	}{
+		{"single", []string{c2}, map[string]string{c2: "c2"}},
+		{"all three", []string{c1, c2, c3}, map[string]string{c1: "c1", c2: "c2", c3: "c3"}},
+		{"reversed order", []string{c3, c1}, map[string]string{c3: "c3", c1: "c1"}},
+		{"duplicates collapse", []string{c1, c1}, map[string]string{c1: "c1"}},
+		{"empty input", nil, map[string]string{}},
+		// A bad SHA fails the batched call; the per-SHA fallback must still
+		// resolve the good ones.
+		{"unresolvable sha among good ones", []string{c1, missing, c3}, map[string]string{c1: "c1", c3: "c3"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := r.Subjects(ctx, tc.in)
+			if len(got) != len(tc.want) {
+				t.Fatalf("got %d entries %+v, want %d %+v", len(got), got, len(tc.want), tc.want)
+			}
+			for s, want := range tc.want {
+				if got[s] != want {
+					t.Errorf("%s: subject=%q want %q", s[:8], got[s], want)
+				}
+			}
+		})
+	}
+}
+
+// porcelainStatus captures the full working-tree state as git sees it.
+// UncommittedDiff must leave this byte-identical: it stages untracked files to
+// make them visible to `git diff`, and doing that in the user's real index
+// would show up here as staged additions.
+func porcelainStatus(t *testing.T, r Repo) string {
+	t.Helper()
+	out, err := r.Run(context.Background(), "status", "--porcelain")
+	if err != nil {
+		t.Fatalf("git status --porcelain: %v", err)
+	}
+	return out
+}
+
+func TestUncommittedDiff(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	// write creates an untracked file; stage additionally adds it to the index.
+	write := func(t *testing.T, r Repo, name, body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(r.Dir, name), []byte(body), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	tests := []struct {
+		name string
+		// setup dirties the tree and returns substrings the diff must contain.
+		setup     func(t *testing.T, r Repo) []string
+		wantEmpty bool
+	}{
+		{
+			name:      "clean tree",
+			setup:     func(t *testing.T, r Repo) []string { return nil },
+			wantEmpty: true,
+		},
+		{
+			name: "modified tracked file",
+			setup: func(t *testing.T, r Repo) []string {
+				write(t, r, "f1.txt", "changed\n")
+				return []string{"f1.txt", "+changed"}
+			},
+		},
+		{
+			name: "staged change",
+			setup: func(t *testing.T, r Repo) []string {
+				write(t, r, "f1.txt", "staged edit\n")
+				mustRun(t, r, ctx, "add", "f1.txt")
+				return []string{"f1.txt", "+staged edit"}
+			},
+		},
+		{
+			name: "untracked file appears as an addition",
+			setup: func(t *testing.T, r Repo) []string {
+				write(t, r, "new.txt", "brand new\n")
+				return []string{"new.txt", "+brand new"}
+			},
+		},
+		{
+			name: "untracked plus tracked plus staged together",
+			setup: func(t *testing.T, r Repo) []string {
+				write(t, r, "f1.txt", "unstaged edit\n")
+				write(t, r, "f2.txt", "will be staged\n")
+				mustRun(t, r, ctx, "add", "f2.txt")
+				write(t, r, "brand-new.txt", "untracked body\n")
+				return []string{"+unstaged edit", "+will be staged", "+untracked body"}
+			},
+		},
+		{
+			name: "untracked file inside a new directory",
+			setup: func(t *testing.T, r Repo) []string {
+				if err := os.MkdirAll(filepath.Join(r.Dir, "sub", "deep"), 0o755); err != nil {
+					t.Fatalf("mkdir: %v", err)
+				}
+				write(t, r, filepath.Join("sub", "deep", "nested.txt"), "nested body\n")
+				return []string{"sub/deep/nested.txt", "+nested body"}
+			},
+		},
+		{
+			name: "file with a space in its name",
+			setup: func(t *testing.T, r Repo) []string {
+				write(t, r, "two words.txt", "spaced body\n")
+				return []string{"two words.txt", "+spaced body"}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r := testRepo(t, 2)
+			want := tc.setup(t, r)
+			before := porcelainStatus(t, r)
+
+			diff, err := r.UncommittedDiff(ctx)
+			if err != nil {
+				t.Fatalf("UncommittedDiff: %v", err)
+			}
+			if tc.wantEmpty {
+				if strings.TrimSpace(diff) != "" {
+					t.Errorf("expected empty diff for clean tree, got:\n%s", diff)
+				}
+			}
+			for _, sub := range want {
+				if !strings.Contains(diff, sub) {
+					t.Errorf("diff missing %q:\n%s", sub, diff)
+				}
+			}
+			if after := porcelainStatus(t, r); after != before {
+				t.Errorf("UncommittedDiff mutated the index\nbefore:\n%s\nafter:\n%s", before, after)
+			}
+		})
+	}
+}
+
+// TestUncommittedDiffManyUntracked exercises the pathspec chunking: with more
+// untracked files than maxPathsPerCall, every one must still land in the diff.
+func TestUncommittedDiffManyUntracked(t *testing.T) {
+	t.Parallel()
 	r := testRepo(t, 1)
 	ctx := context.Background()
-	sha, _ := r.RevParse(ctx, "HEAD")
-	got, err := r.CommitsContainedIn(ctx, "origin/does-not-exist", []string{sha})
-	if err != nil {
-		t.Fatalf("CommitsContainedIn unknown ref: %v", err)
+
+	const n = maxPathsPerCall + 20
+	for i := range n {
+		name := "u" + itoa(i) + ".txt"
+		if err := os.WriteFile(filepath.Join(r.Dir, name), []byte("body "+itoa(i)+"\n"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
 	}
-	if len(got) != 0 && got[sha] {
-		t.Errorf("expected no commits reported as contained, got %+v", got)
+	before := porcelainStatus(t, r)
+
+	diff, err := r.UncommittedDiff(ctx)
+	if err != nil {
+		t.Fatalf("UncommittedDiff: %v", err)
+	}
+	for i := range n {
+		if !strings.Contains(diff, "u"+itoa(i)+".txt") {
+			t.Fatalf("diff missing u%d.txt (chunk boundary lost files)", i)
+		}
+	}
+	if after := porcelainStatus(t, r); after != before {
+		t.Errorf("UncommittedDiff mutated the index\nbefore len=%d after len=%d", len(before), len(after))
+	}
+}
+
+// TestUncommittedDiffKeepsGoodPathsOnBadPath covers the per-path retry: an
+// unreadable file among several must not cost us the readable ones.
+func TestUncommittedDiffKeepsGoodPathsOnBadPath(t *testing.T) {
+	t.Parallel()
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: chmod 000 does not deny access")
+	}
+	r := testRepo(t, 1)
+	ctx := context.Background()
+
+	for _, name := range []string{"good-a.txt", "bad.txt", "good-b.txt"} {
+		if err := os.WriteFile(filepath.Join(r.Dir, name), []byte("body of "+name+"\n"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	bad := filepath.Join(r.Dir, "bad.txt")
+	if err := os.Chmod(bad, 0o000); err != nil {
+		t.Fatalf("chmod bad.txt: %v", err)
+	}
+	// Restore the mode so t.TempDir cleanup can remove it.
+	t.Cleanup(func() { _ = os.Chmod(bad, 0o644) })
+
+	diff, err := r.UncommittedDiff(ctx)
+	if err != nil {
+		t.Fatalf("UncommittedDiff: %v", err)
+	}
+	for _, name := range []string{"good-a.txt", "good-b.txt"} {
+		if !strings.Contains(diff, name) {
+			t.Errorf("diff lost readable file %s:\n%s", name, diff)
+		}
 	}
 }

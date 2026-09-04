@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 
 	"charm.land/bubbles/v2/key"
@@ -447,18 +448,8 @@ func (m ReviewModel) diffKey() string {
 	}
 	r := m.rows[m.cursor]
 	pool := m.pools[r.poolIdx]
-	files := append([]string(nil), r.files...)
-	for i := 1; i < len(files); i++ {
-		for j := i; j > 0 && files[j-1] > files[j]; j-- {
-			files[j-1], files[j] = files[j], files[j-1]
-		}
-	}
-	hunks := append([]int(nil), r.hunks...)
-	for i := 1; i < len(hunks); i++ {
-		for j := i; j > 0 && hunks[j-1] > hunks[j]; j-- {
-			hunks[j-1], hunks[j] = hunks[j], hunks[j-1]
-		}
-	}
+	files := slices.Sorted(slices.Values(r.files))
+	hunks := slices.Sorted(slices.Values(r.hunks))
 	hunkParts := make([]string, len(hunks))
 	for i, h := range hunks {
 		hunkParts[i] = fmt.Sprintf("%d", h)

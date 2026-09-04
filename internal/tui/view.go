@@ -3,7 +3,7 @@ package tui
 import (
 	"fmt"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -432,7 +432,7 @@ func renderFileTree(files []git.FileStat, s styles) string {
 		}
 		groups[dir] = append(groups[dir], f)
 	}
-	sort.Strings(dirs)
+	slices.Sort(dirs)
 
 	var b strings.Builder
 	// Root-level files first.
@@ -782,11 +782,4 @@ func indent(s, prefix string) string {
 		lines[i] = prefix + l
 	}
 	return strings.Join(lines, "\n")
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }

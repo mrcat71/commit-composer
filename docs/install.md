@@ -1,8 +1,9 @@
 # Installing commit-composer
 
-`commit-composer` ships as a Claude Code plugin (slash command +
-model-invoked skill) backed by a Go TUI binary. Claude Code installs
-plugins through a *marketplace*, so even for a personal local install you
+`commit-composer` ships as a Claude Code plugin - two skills
+(`commit-compose` and `cc-commit`), each also callable as a slash
+command - backed by a Go TUI binary. Claude Code installs plugins
+through a *marketplace*, so even for a personal local install you
 register the repo as a marketplace and then install the plugin from it.
 
 ## Prerequisites
@@ -11,7 +12,7 @@ register the repo as a marketplace and then install the plugin from it.
 - Claude Code CLI (for the `/plugin` slash commands)
 - A terminal that supports one of the overlay backends commit-composer
   knows about, or a regular terminal (it falls back to inline)
-- Go 1.24+ only if installing from source
+- Go 1.27+ only if installing from source
 
 ## Option A: Homebrew (recommended)
 
@@ -25,8 +26,8 @@ brew install commit-composer
 This installs:
 
 - the `commit-composer` binary to `$(brew --prefix)/bin/`
-- the plugin files (slash command, skill, launcher) to
-  `$(brew --prefix)/share/commit-composer/.claude-plugin/`
+- the plugin files to `$(brew --prefix)/share/commit-composer/`:
+  `.claude-plugin/` (manifests), `skills/`, and `scripts/` (launcher)
 
 `$(brew --prefix)` is:
 
@@ -65,9 +66,9 @@ cd commit-composer
 ./scripts/install.sh
 ```
 
-This produces `.claude-plugin/bin/commit-composer`. The bash launcher
-prefers that bundled binary over any `commit-composer` on `$PATH`. To
-also install the binary system-wide:
+This produces `bin/commit-composer`. The bash launcher prefers that
+bundled binary over any `commit-composer` on `$PATH`. To also install
+the binary system-wide:
 
 ```bash
 go install ./cmd/commit-composer
@@ -82,11 +83,12 @@ In a Claude Code session, run:
 /reload-plugins
 ```
 
-You should now see:
+You should now see both entry points listed under `/help` and in the
+skills index:
 
-- `/commit-composer:commit-compose` listed under `/help` (slash command)
-- The `commit-composer` skill listed in the skills index
-  (model-invoked alias)
+- `/commit-composer:commit-compose` - picker + review TUI, applies via
+  `git rebase -i`
+- `/commit-composer:cc-commit` - fast no-TUI commit of the working tree
 
 ## Verify it works
 
@@ -103,16 +105,14 @@ confirmation.
 
 ## Known issues
 
-- **Local-directory marketplaces and slash commands**: there is a known
-  Claude Code bug
+- **Local-directory marketplaces**: there is a known Claude Code bug
   ([anthropics/claude-code#14929](https://github.com/anthropics/claude-code/issues/14929))
-  where slash commands from a *directory-based* local marketplace
-  sometimes are not discovered, while skills from the same marketplace
-  are. If `/commit-composer:commit-compose` does not show up after install, the
-  workaround is to push the repo to git and use
-  `/plugin marketplace add <user>/<repo>` instead of the local path.
-  Skills are unaffected, so `commit-composer` (the skill alias) should
-  always work.
+  where components from a *directory-based* local marketplace are
+  sometimes not discovered. If neither
+  `/commit-composer:commit-compose` nor `/commit-composer:cc-commit`
+  shows up after install, the workaround is to push the repo to git and
+  use `/plugin marketplace add <user>/<repo>` instead of the local
+  path.
 
 - **Desktop app plugin UI** currently only supports marketplace-based
   installs, not local-directory registration. Use the CLI for the
@@ -154,8 +154,10 @@ re-executes the binary on every invocation.
 By default the launcher looks up the binary in this order:
 
 1. `$COMMIT_COMPOSER_BIN` (if set and executable)
-2. `commit-composer` on `$PATH`
-3. `<plugin-root>/bin/commit-composer`
+2. `<plugin-root>/bin/commit-composer` (bundled build - checked before
+   `$PATH` so a stale `go install`ed binary never shadows the one that
+   ships with the current plugin install)
+3. `commit-composer` on `$PATH`
 4. `go run ./cmd/commit-composer` from the cloned repo (dev fallback)
 
 Setting `COMMIT_COMPOSER_BIN=/path/to/your/binary` is useful when
@@ -169,9 +171,11 @@ in this order:
 
 1. `$COMMIT_COMPOSER_LAUNCHER` (if set and executable)
 2. `$CLAUDE_PLUGIN_DATA/scripts/launch-commit-composer.sh` (user override)
-3. `<plugin-root>/.claude-plugin/scripts/launch-commit-composer.sh`
-   (from the `--plugin-root` the command passes, i.e. `$CLAUDE_PLUGIN_ROOT`)
-4. `<binary-dir>/../scripts/launch-commit-composer.sh` (source checkout)
+3. `<root>/scripts/launch-commit-composer.sh` for each of two roots in
+   turn: the `--plugin-root` the skill passes, then `$CLAUDE_PLUGIN_ROOT`
+4. `<root>/.claude-plugin/scripts/launch-commit-composer.sh` for the same
+   two roots (pre-0.4 layout, for a stale plugin cache)
+5. `<binary-dir>/../scripts/launch-commit-composer.sh` (source checkout)
 
 To customise terminal-overlay behaviour without forking the plugin,
 either point `COMMIT_COMPOSER_LAUNCHER` at your script or drop a

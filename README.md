@@ -70,14 +70,14 @@ Then, inside a Claude Code session:
 /reload-plugins
 ```
 
-Requires Go 1.24+ and a recent `git` on `$PATH`.
+Requires Go 1.27+ and a recent `git` on `$PATH`.
 
-> Known issue: slash commands from directory-based local marketplaces
-> can fail to register
+> If neither `/commit-composer:commit-compose` nor
+> `/commit-composer:cc-commit` appears after `/reload-plugins`, push the
+> repo to git and `/plugin marketplace add <user>/<repo>` instead -
+> directory-based local marketplaces have historically been flaky about
+> registering plugin components
 > ([claude-code#14929](https://github.com/anthropics/claude-code/issues/14929)).
-> The `commit-composer` skill alias is unaffected. If `/commit-composer:commit-compose`
-> does not appear, push the repo to git and
-> `/plugin marketplace add <user>/<repo>` instead.
 
 ## Usage
 
@@ -210,9 +210,9 @@ is clear and should describe the affected feature/module/service/
 chart/role/package rather than the implementation technology (so
 `feat(gitlab-access-token): ...` rather than `feat(terraform): ...`).
 The full ruleset lives in
-[`.claude-plugin/commands/commit-compose.md`](.claude-plugin/commands/commit-compose.md)
-under "Commit-message rules"; the binary has no validator, so the
-rules are enforced by Claude's prompt and your `$EDITOR` review pass.
+[`skills/commit-compose/references/commit-message-rules.md`](skills/commit-compose/references/commit-message-rules.md);
+the binary has no validator, so the rules are enforced by Claude's
+prompt and your `$EDITOR` review pass.
 
 ## Plan format
 
@@ -297,19 +297,21 @@ commit-composer/
 │   ├── git/        # exec wrappers + rebase driver
 │   ├── plan/       # data model + serialize / parse
 │   └── tui/        # bubbletea Model / Update / View
-├── .claude-plugin/
+├── .claude-plugin/                    # manifests only
 │   ├── plugin.json
-│   ├── marketplace.json
-│   ├── commands/
-│   │   ├── commit-compose.md           # full TUI flow
-│   │   └── cc-commit.md                # fast no-TUI working-tree commit
-│   ├── skills/
-│   │   ├── commit-composer/SKILL.md    # alias for /commit-compose
-│   │   └── cc-commit/SKILL.md          # alias for /cc-commit
-│   └── scripts/
-│       ├── launch-commit-composer.sh   # terminal-overlay dispatcher (run via `commit-composer __launch`)
-│       └── resolve-launcher.sh         # user-override resolver
-├── scripts/install.sh
+│   └── marketplace.json
+├── skills/
+│   ├── commit-compose/
+│   │   ├── SKILL.md                    # full TUI flow
+│   │   └── references/
+│   │       └── commit-message-rules.md # shared by both skills
+│   └── cc-commit/
+│       └── SKILL.md                    # fast no-TUI working-tree commit
+├── bin/commit-composer                 # tracked build (see .gitignore)
+├── scripts/
+│   ├── install.sh                      # build into bin/ + go install
+│   ├── launch-commit-composer.sh       # terminal-overlay dispatcher (run via `commit-composer __launch`)
+│   └── resolve-launcher.sh             # user-override resolver
 └── docs/
     ├── commit-composer-plan.md         # original design plan
     ├── install.md                      # full install + troubleshooting
@@ -321,14 +323,13 @@ commit-composer/
 ```bash
 go test ./...                              # unit + integration tests
 go build ./...                             # build everything
-./scripts/install.sh                       # build into .claude-plugin/bin
+./scripts/install.sh                       # build into bin/ and onto $PATH
 go run ./cmd/commit-composer HEAD~5        # run against current repo
 ```
 
 ## Acknowledgements
 
-The plugin manifest, skill-alias pattern, and bash-driven overlay
-detection are adapted from
+The plugin manifest and bash-driven overlay detection are adapted from
 [umputun/revdiff](https://github.com/umputun/revdiff).
 
 ## License
