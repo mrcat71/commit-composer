@@ -76,7 +76,7 @@ The `release.yml` GitHub Actions workflow triggers on tags matching `v*`.
 It will:
 
 1. Check out the tagged commit
-2. Install Go 1.24
+2. Install Go 1.27
 3. Run `goreleaser release --clean`, which:
    - Builds `commit-composer` for `darwin-arm64` and `darwin-amd64` with
      `-X main.version=$TAG` baked in

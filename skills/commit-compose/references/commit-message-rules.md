@@ -83,6 +83,21 @@ Use the shorthand:
 chore(deps): update <dependency> to <version>
 ```
 
+## Authorship trailers
+
+Never add AI attribution to a message you propose. No
+`Co-Authored-By:` for Claude, Codex, OpenAI, Anthropic, or any other
+model or assistant; no `Generated with Claude Code`; no
+`Claude-Session:` trailer. The commit is the user's.
+
+Add such a trailer only when the user asks for it explicitly in this
+invocation - a hint like "credit Claude as co-author" counts, the
+absence of any instruction does not.
+
+Trailers the user already wrote are not yours to remove: when you
+reword or squash existing commits, carry over their `Co-Authored-By:`,
+`Signed-off-by:`, `Refs:`, and similar trailers unchanged.
+
 ## Scope-selection cheatsheet
 
 When you are about to write a scope and find yourself reaching for
