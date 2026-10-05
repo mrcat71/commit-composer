@@ -4,10 +4,16 @@
     "config:recommended"
   ],
   "timezone": "Europe/Madrid",
-  "prCreation": "immediate",
+  "prCreation": "status-success",
+  "assignees": ["mrcat71"],
+  "assignAutomerge": true,
   "prHourlyLimit": 0,
   "minimumReleaseAge": "7 days",
   "minimumReleaseAgeBehaviour": "timestamp-required",
-  "internalChecksFilter": "none",
+  "internalChecksFilter": "strict",
+  "internalChecksAsSuccess": false,
+  "vulnerabilityAlerts": {
+    "prCreation": "status-success"
+  },
   "pinDigests": true
 }

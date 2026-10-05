@@ -327,6 +327,23 @@ go build ./...                             # build everything
 go run ./cmd/commit-composer HEAD~5        # run against current repo
 ```
 
+CI runs formatting checks, `go vet ./...`, `go test -count=1 ./...`, and
+`go build ./...` on pushes to `main` and `renovate/**` and on same-repository PRs.
+It uses the existing `commit-composer` ARC scale set. Fork PRs are excluded from
+the self-hosted runner. Release publishing remains restricted to version tags.
+
+### Dependency updates
+
+Renovate waits seven days from release for updates subject to release-age
+checks before creating a branch (`internalChecksFilter: strict`). CI runs on
+`renovate/**` before a PR exists. Once branch checks pass, Renovate opens the PR
+and assigns `mrcat71`, including PRs configured for automerge. There is no weekly
+creation window or second seven-day wait inside the PR. Internal release-age
+checks do not substitute for CI. Updates missing required release timestamps
+remain pending in the Dependency Dashboard. Vulnerability alerts skip the age
+delay but still wait for successful branch checks. PR merge-commit checks run
+again after creation. The policy lives in `.github/renovate.json`.
+
 ## Acknowledgements
 
 The plugin manifest and bash-driven overlay detection are adapted from
